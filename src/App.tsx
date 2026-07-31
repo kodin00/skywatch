@@ -76,12 +76,10 @@ function Logo() {
 
 function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnected: (status: StatusResponse) => void }) {
   const [token, setToken] = useState('')
-  const [visible, setVisible] = useState(false)
   const [state, setState] = useState<SetupState>('token')
   const [task, setTask] = useState(-1)
   const [error, setError] = useState('')
   const [account, setAccount] = useState<{ id: string; name: string } | null>(null)
-  const tokenReady = token.trim().length >= 20
   const isUnlock = mode === 'unlock'
 
   useEffect(() => {
@@ -92,21 +90,22 @@ function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnec
     return () => window.clearInterval(timer)
   }, [state])
 
-  const connect = async () => {
-    if (!tokenReady) return
+  const connect = async (submittedToken = token) => {
+    const cleanToken = submittedToken.trim()
+    if (cleanToken.length < 20) return
     setError('')
     setState('working')
     setTask(isUnlock ? 2 : 0)
     try {
       if (isUnlock) {
-        await api('/api/unlock', { method: 'POST', body: JSON.stringify({ token: token.trim() }) })
+        await api('/api/unlock', { method: 'POST', body: JSON.stringify({ token: cleanToken }) })
         const status = await api<StatusResponse>('/api/status')
         onConnected(status)
         return
       }
       const result = await api<{ account: { id: string; name: string } }>('/api/setup', {
         method: 'POST',
-        body: JSON.stringify({ token: token.trim() }),
+        body: JSON.stringify({ token: cleanToken }),
       })
       setAccount(result.account)
       setTask(setupTasks.length)
@@ -134,48 +133,51 @@ function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnec
 
   return (
     <main className="setup-shell">
-      <header className="setup-header">
-        <Logo />
-        <span className="secure-note"><LockKeyhole size={14} /> Secure setup</span>
-      </header>
+      <div className="setup-wordmark" aria-hidden="true">SKYWATCH</div>
 
-      <section className="setup-stage">
-        <div className="setup-intro">
-          <span className="eyebrow"><span /> {isUnlock ? 'Protected workspace' : 'Connect Cloudflare'}</span>
-          <h1>Your Workers,<br /><em>under watch.</em></h1>
-          <p>{isUnlock ? 'This Skywatch instance is already configured. Use its original API token to unlock this browser.' : 'Connect your Cloudflare account once. Skywatch prepares a private vault, finds your Workers, and keeps every access rule in view.'}</p>
-          <div className="trust-line"><ShieldCheck size={17} /> Your token is encrypted before it touches storage.</div>
-        </div>
-
-        <div className="setup-card">
+      <section className="setup-center">
+        <div className="setup-flow">
           {state === 'token' && (
-            <>
-              <div className="step-count">01 <span>/ 01</span></div>
-              <div className="card-heading">
-                <div className="icon-tile"><KeyRound size={21} /></div>
-                <div><h2>{isUnlock ? 'Unlock Skywatch' : 'Connect your account'}</h2><p>Use a scoped API token—not your Global API Key.</p></div>
+            <div className="token-view">
+              <div className="permission-heading">
+                <h1>{isUnlock ? 'Unlock Skywatch' : 'Required token permissions'}</h1>
+                <p>{isUnlock ? 'Paste the API token used to set up this instance.' : 'Create a scoped token with exactly these permissions.'}</p>
               </div>
 
-              {!isUnlock && <div className="permission-box">
-                <div className="permission-title"><ShieldCheck size={16} /><span>Required token permissions</span><a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noreferrer">Create token <ArrowRight size={13} /></a></div>
-                <div className="permission-row"><span>Account</span><strong>Workers Scripts · Read + Edit</strong></div>
-                <div className="permission-row"><span>Account</span><strong>Access: Apps and Policies · Edit</strong></div>
-                <div className="permission-row"><span>User</span><strong>Memberships · Read</strong></div>
-                <div className="permission-row"><span>Resources</span><strong>Include · One account</strong></div>
-              </div>}
+              {!isUnlock && <>
+                <div className="permission-list">
+                  <div className="permission-row"><span>Account</span><strong>Workers Scripts</strong><em>Read + Edit</em></div>
+                  <div className="permission-row"><span>Account</span><strong>Access: Apps and Policies</strong><em>Edit</em></div>
+                  <div className="permission-row"><span>User</span><strong>Memberships</strong><em>Read</em></div>
+                  <div className="permission-row"><span>Resources</span><strong>Include</strong><em>One account</em></div>
+                </div>
+                <a className="create-token-button" href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noreferrer">Create token</a>
+              </>}
 
               <form onSubmit={(event) => { event.preventDefault(); void connect() }}>
-                <label className="token-label" htmlFor="api-token">Cloudflare API token</label>
-                <div className={`token-input ${token && !tokenReady ? 'invalid' : ''}`}>
-                  <KeyRound size={17} />
-                  <input id="api-token" autoComplete="off" spellCheck="false" type={visible ? 'text' : 'password'} placeholder="Paste your token here" value={token} onChange={(event) => setToken(event.target.value)} />
-                  <button type="button" onClick={() => setVisible((value) => !value)}>{visible ? 'Hide' : 'Show'}</button>
-                </div>
+                <label className="sr-only" htmlFor="api-token">Cloudflare API token</label>
+                <input
+                  className="token-field"
+                  id="api-token"
+                  autoComplete="off"
+                  spellCheck="false"
+                  type="password"
+                  placeholder="paste your token here"
+                  value={token}
+                  onChange={(event) => setToken(event.target.value)}
+                  onPaste={(event) => {
+                    const pastedToken = event.clipboardData.getData('text').trim()
+                    if (pastedToken.length < 20) return
+                    event.preventDefault()
+                    setToken(pastedToken)
+                    window.setTimeout(() => void connect(pastedToken), 0)
+                  }}
+                />
                 {error && <p className="form-error" role="alert">{error}</p>}
-                <button className="primary-button" type="submit" disabled={!tokenReady}>{isUnlock ? 'Unlock this browser' : 'Connect Cloudflare'} <ArrowRight size={17} /></button>
-                <p className="microcopy"><LockKeyhole size={12} /> Skywatch never returns your token to the browser.</p>
               </form>
-            </>
+
+              <div className="setup-disclaimer"><ShieldCheck size={17} /> Your token is encrypted before it touches storage.</div>
+            </div>
           )}
 
           {state === 'working' && (
@@ -207,8 +209,6 @@ function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnec
           )}
         </div>
       </section>
-
-      <footer className="setup-footer"><span>Built for Cloudflare Workers</span><span className="footer-dash" /><span>Token stored with AES-256-GCM encryption</span></footer>
     </main>
   )
 }
