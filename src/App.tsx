@@ -29,7 +29,7 @@ type StatusResponse = {
   authenticated: boolean
   account: { id: string; name: string } | null
   database: 'connected'
-  encryption: 'pending' | 'finalizing' | 'ready'
+  encryption: 'pending' | 'finalizing' | 'ready' | 'mismatch'
 }
 
 type Worker = {
@@ -133,6 +133,10 @@ function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnec
       const status = await api<StatusResponse>('/api/status')
       if (status.encryption === 'ready') {
         onConnected(status)
+        return
+      }
+      if (status.encryption === 'mismatch') {
+        setError('The stored token and Worker encryption key do not match. Reset the broken configuration before retrying setup.')
         return
       }
       await new Promise((resolve) => window.setTimeout(resolve, 1200))

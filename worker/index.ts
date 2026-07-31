@@ -169,6 +169,7 @@ async function getStatus(request: Request, env: RuntimeEnv): Promise<Response> {
   await ensureSchema(env.DB);
   const configuration = await readConfiguration(env.DB);
   const authenticated = configuration ? await isAuthenticated(request, env.DB) : false;
+  const encryption = await getEncryptionState(env, configuration);
 
   return json({
     configured: Boolean(configuration),
@@ -177,7 +178,7 @@ async function getStatus(request: Request, env: RuntimeEnv): Promise<Response> {
       ? { id: configuration.account_id, name: configuration.account_name }
       : null,
     database: "connected",
-    encryption: env.SKYWATCH_TOKEN_KEY ? "ready" : configuration ? "finalizing" : "pending",
+    encryption,
   });
 }
 
@@ -207,27 +208,33 @@ async function setup(request: Request, env: RuntimeEnv, url: URL): Promise<Respo
     await verifyApiToken(token);
     const memberships = await cloudflareRequest<Membership[]>(token, "/memberships?status=accepted&per_page=100", { method: "GET" });
     const account = await discoverScopedAccount(token, memberships);
-    const keyBytes = crypto.getRandomValues(new Uint8Array(32));
-    const key = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+    let key = env.SKYWATCH_TOKEN_KEY;
+    let keyCreated = false;
+    if (!key) {
+      const keyBytes = crypto.getRandomValues(new Uint8Array(32));
+      key = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+      keyCreated = true;
+
+      const workerName = env.SKYWATCH_WORKER_NAME || inferWorkerName(url);
+      await cloudflareRequest(
+        token,
+        `/accounts/${account.id}/workers/scripts/${encodeURIComponent(workerName)}/secrets`,
+        {
+          method: "PUT",
+          body: {
+            name: ENCRYPTION_BINDING,
+            type: "secret_key",
+            format: "raw",
+            algorithm: { name: "AES-GCM" },
+            usages: ["encrypt", "decrypt"],
+            key_base64: bytesToBase64(keyBytes),
+          },
+        },
+      );
+    }
+
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: TOKEN_AAD }, key, new TextEncoder().encode(token));
-
-    const workerName = env.SKYWATCH_WORKER_NAME || inferWorkerName(url);
-    await cloudflareRequest(
-      token,
-      `/accounts/${account.id}/workers/scripts/${encodeURIComponent(workerName)}/secrets`,
-      {
-        method: "PUT",
-        body: {
-          name: ENCRYPTION_BINDING,
-          type: "secret_key",
-          format: "raw",
-          algorithm: { name: "AES-GCM" },
-          usages: ["encrypt", "decrypt"],
-          key_base64: bytesToBase64(keyBytes),
-        },
-      },
-    );
 
     await env.DB.prepare(`INSERT INTO skywatch_config
       (id, account_id, account_name, token_ciphertext, token_iv)
@@ -237,7 +244,7 @@ async function setup(request: Request, env: RuntimeEnv, url: URL): Promise<Respo
 
     const sessionCookie = await createSession(env.DB);
     return json(
-      { configured: true, account: { id: account.id, name: account.name }, encryption: "finalizing" },
+      { configured: true, account: { id: account.id, name: account.name }, encryption: keyCreated ? "finalizing" : "ready" },
       201,
       { "Set-Cookie": sessionCookie },
     );
@@ -607,6 +614,24 @@ async function decryptStoredToken(env: RuntimeEnv): Promise<string> {
     return new TextDecoder().decode(clear);
   } catch {
     throw new HttpError(500, "The stored API token could not be decrypted.", "token_decryption_failed");
+  }
+}
+
+async function getEncryptionState(
+  env: RuntimeEnv,
+  configuration: StoredConfiguration | null,
+): Promise<"pending" | "finalizing" | "ready" | "mismatch"> {
+  if (!configuration) return env.SKYWATCH_TOKEN_KEY ? "ready" : "pending";
+  if (!env.SKYWATCH_TOKEN_KEY) return "finalizing";
+  try {
+    await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: base64ToBytes(configuration.token_iv), additionalData: TOKEN_AAD },
+      env.SKYWATCH_TOKEN_KEY,
+      base64ToBytes(configuration.token_ciphertext),
+    );
+    return "ready";
+  } catch {
+    return "mismatch";
   }
 }
 
