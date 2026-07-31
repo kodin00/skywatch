@@ -169,19 +169,8 @@ async function setup(request: Request, env: RuntimeEnv, url: URL): Promise<Respo
 
   try {
     await verifyApiToken(token);
-    const memberships = await cloudflareRequest<Membership[]>(token, "/memberships?status=accepted", { method: "GET" });
-    const accounts = memberships.map((membership) => membership.account).filter((account): account is Account => Boolean(account));
-    if (accounts.length !== 1) {
-      throw new HttpError(
-        400,
-        accounts.length === 0
-          ? "This token cannot discover a Cloudflare account. Add User Memberships: Read and scope it to one account."
-          : "Scope the API token to one Cloudflare account so Skywatch knows which account to manage.",
-        "account_scope_required",
-      );
-    }
-
-    const account = accounts[0];
+    const memberships = await cloudflareRequest<Membership[]>(token, "/memberships?status=accepted&per_page=100", { method: "GET" });
+    const account = await discoverScopedAccount(token, memberships);
     const keyBytes = crypto.getRandomValues(new Uint8Array(32));
     const key = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
     const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -391,6 +380,39 @@ async function verifyApiToken(token: string): Promise<void> {
   }
 }
 
+async function discoverScopedAccount(token: string, memberships: Membership[]): Promise<Account> {
+  const candidates = uniqueAccounts(
+    memberships.map((membership) => membership.account).filter((account): account is Account => Boolean(account)),
+  );
+  if (candidates.length === 0) {
+    throw new HttpError(
+      400,
+      "This token cannot discover a Cloudflare account. Add User Memberships: Read and include one account.",
+      "account_scope_required",
+    );
+  }
+
+  const accessible = (await Promise.all(candidates.map(async (account) => {
+    const response = await fetch(
+      `${API_ROOT}/accounts/${account.id}/workers/scripts-search?per_page=1`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    const data = await parseEnvelope<unknown>(response);
+    return response.ok && data.success ? account : null;
+  }))).filter((account): account is Account => Boolean(account));
+
+  if (accessible.length !== 1) {
+    throw new HttpError(
+      400,
+      accessible.length === 0
+        ? "This token cannot read Workers in the selected account. Check Workers Scripts: Read and the included account."
+        : "This token can access more than one Cloudflare account. Include only one account.",
+      "account_scope_required",
+    );
+  }
+  return accessible[0];
+}
+
 async function cloudflareRequest<T>(
   token: string,
   path: string,
@@ -490,6 +512,10 @@ function collectEmails(value: unknown): string[] {
 
 function managedAppName(workerName: string): string {
   return `Skywatch · ${workerName}`;
+}
+
+function uniqueAccounts(accounts: Account[]): Account[] {
+  return [...new Map(accounts.map((account) => [account.id, account])).values()];
 }
 
 function inferWorkerName(url: URL): string {

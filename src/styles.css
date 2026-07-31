@@ -41,7 +41,7 @@ button { color: inherit; }
 .setup-shell { min-height: 100svh; overflow: hidden; position: relative; display: grid; place-items: center; padding: clamp(170px, 24vh, 250px) 24px 56px; background: var(--canvas); }
 .setup-shell::before { content: ''; position: absolute; inset: 0; pointer-events: none; opacity: .25; background-image: linear-gradient(var(--line-soft) 1px, transparent 1px), linear-gradient(90deg, var(--line-soft) 1px, transparent 1px); background-size: 72px 72px; mask-image: linear-gradient(to bottom, #fff 0%, rgba(255,255,255,.72) 72%, transparent 100%); }
 .setup-shell::after { content: ''; position: absolute; inset: 0; pointer-events: none; background: radial-gradient(circle at 50% 48%, rgba(169,212,189,.055), transparent 37%); }
-.setup-wordmark { position: absolute; z-index: 0; top: clamp(28px, 5.5vh, 64px); left: 50%; width: 100%; transform: translateX(-50%); pointer-events: none; text-align: center; white-space: nowrap; font-size: clamp(67px, 19vw, 310px); font-weight: 800; line-height: .76; letter-spacing: -.085em; background: linear-gradient(180deg, rgba(99,108,108,.035) 0%, rgba(142,153,151,.2) 100%); background-clip: text; -webkit-background-clip: text; color: transparent; user-select: none; }
+.setup-wordmark { position: absolute; z-index: 0; top: clamp(28px, 5.5vh, 64px); left: 50%; width: 100vw; transform: translateX(-50%); pointer-events: none; text-align: center; white-space: nowrap; font-size: 20.9vw; font-weight: 800; line-height: .76; letter-spacing: -.085em; background: linear-gradient(180deg, rgba(99,108,108,.035) 0%, rgba(142,153,151,.2) 100%); background-clip: text; -webkit-background-clip: text; color: transparent; user-select: none; }
 .setup-center { position: relative; z-index: 1; width: min(540px, 100%); }
 .setup-flow { width: 100%; }
 .token-view { text-align: center; }
@@ -240,7 +240,7 @@ button { color: inherit; }
 @media (max-width: 680px) {
   .setup-shell { min-height: 100svh; overflow-y: auto; padding: 136px 18px 36px; }
   .setup-shell::before { background-size: 48px 48px; }
-  .setup-wordmark { top: 31px; font-size: clamp(61px, 20.7vw, 140px); }
+  .setup-wordmark { top: 31px; font-size: 20.7vw; }
   .permission-heading h1 { font-size: 18px; }
   .permission-list { margin-top: 24px; }
   .permission-row { min-height: 48px; grid-template-columns: 62px minmax(0, 1fr); gap: 4px 10px; padding: 7px 0; }
