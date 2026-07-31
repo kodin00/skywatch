@@ -21,8 +21,9 @@ Create a custom token scoped to exactly one Cloudflare account:
 - Account → Access: Apps and Policies → Edit
 - Account → Access: Audit Logs → Read
 - User → Memberships → Read
+- User → User Details → Read
 
-Workers Scripts Edit is required once during setup so Skywatch can add its own non-readable encryption-key binding. Access Audit Logs Read is used only to count active Access and Gateway seats; user records are counted inside the Worker and are not returned to the browser. Access edits are limited to applications named and created by Skywatch; existing Access applications are displayed but not overwritten.
+Workers Scripts Edit is required once during setup so Skywatch can add its own non-readable encryption-key binding. User Details Read lets setup identify the token owner's email and automatically put Cloudflare Access in front of the Skywatch Worker with an owner-only policy. Access Audit Logs Read is used only to count active Access and Gateway seats; user records are counted inside the Worker and are not returned to the browser. Access edits are limited to applications named and created by Skywatch; existing Access applications are displayed but not overwritten.
 
 ## Deploy
 
@@ -40,7 +41,7 @@ After deployment, open the Worker URL and paste the scoped API token. The token 
 
 ### First-run security
 
-The first successful setup claims the installation and issues a session to that browser. Open the deployment immediately after creating it, or temporarily protect the fresh Worker with Cloudflare Access while onboarding. After setup, other browsers must prove possession of the same API token to unlock Skywatch.
+The first successful setup claims the installation, issues a session to that browser, reads the token owner's email, and creates a Cloudflare Access application for the Skywatch Worker with an Allow policy for exactly that email. Open the deployment immediately after creating it because this protection is installed only after the setup token has been validated.
 
 ## Local development
 

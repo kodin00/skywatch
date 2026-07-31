@@ -22,6 +22,7 @@ type ApiEnvelope<T> = {
 };
 
 type Account = { id: string; name: string };
+type CloudflareUser = { email: string };
 type Membership = { account?: Account };
 type WorkerRecord = {
   id: string;
@@ -51,6 +52,7 @@ type AccessApplication = {
   destinations?: Array<{ type?: string; worker_id?: string; uri?: string }>;
   policies?: AccessPolicy[];
 };
+type AccessReusablePolicy = AccessPolicy & { app_count?: number };
 type AccessUser = {
   access_seat?: boolean;
   gateway_seat?: boolean;
@@ -113,6 +115,9 @@ export default {
       }
       if (request.method === "POST" && url.pathname === "/api/logout") {
         return withHeaders(await logout(request, env));
+      }
+      if (request.method === "POST" && url.pathname === "/api/protect-self") {
+        return withHeaders(await protectSelf(request, env, url));
       }
       if (request.method === "GET" && url.pathname === "/api/workers") {
         return withHeaders(await listWorkers(request, env));
@@ -208,6 +213,18 @@ async function setup(request: Request, env: RuntimeEnv, url: URL): Promise<Respo
     await verifyApiToken(token);
     const memberships = await cloudflareRequest<Membership[]>(token, "/memberships?status=accepted&per_page=100", { method: "GET" });
     const account = await discoverScopedAccount(token, memberships);
+    const owner = await getTokenOwner(token);
+    const workerName = env.SKYWATCH_WORKER_NAME || inferWorkerName(url);
+    const workers = await cloudflarePaginatedRequest<WorkerRecord>(
+      token,
+      `/accounts/${account.id}/workers/scripts-search`,
+      100,
+    );
+    const instanceWorker = workers.find((worker) => worker.script_name === workerName || worker.service_name === workerName);
+    if (!instanceWorker) {
+      throw new HttpError(400, `Skywatch could not find the deployed Worker named ${workerName}.`, "worker_not_found");
+    }
+
     let key = env.SKYWATCH_TOKEN_KEY;
     let keyCreated = false;
     if (!key) {
@@ -215,7 +232,6 @@ async function setup(request: Request, env: RuntimeEnv, url: URL): Promise<Respo
       key = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
       keyCreated = true;
 
-      const workerName = env.SKYWATCH_WORKER_NAME || inferWorkerName(url);
       await cloudflareRequest(
         token,
         `/accounts/${account.id}/workers/scripts/${encodeURIComponent(workerName)}/secrets`,
@@ -244,7 +260,12 @@ async function setup(request: Request, env: RuntimeEnv, url: URL): Promise<Respo
 
     const sessionCookie = await createSession(env.DB);
     return json(
-      { configured: true, account: { id: account.id, name: account.name }, encryption: keyCreated ? "finalizing" : "ready" },
+      {
+        configured: true,
+        account: { id: account.id, name: account.name },
+        encryption: keyCreated ? "finalizing" : "ready",
+        protection: { email: owner.email, pending: true },
+      },
       201,
       { "Set-Cookie": sessionCookie },
     );
@@ -273,6 +294,25 @@ async function logout(request: Request, env: RuntimeEnv): Promise<Response> {
   return json({ authenticated: false }, 200, {
     "Set-Cookie": `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`,
   });
+}
+
+async function protectSelf(request: Request, env: RuntimeEnv, url: URL): Promise<Response> {
+  await requireAuthentication(request, env.DB);
+  const config = await requireConfiguration(env.DB);
+  const token = await decryptStoredToken(env);
+  const owner = await getTokenOwner(token);
+  const workerName = env.SKYWATCH_WORKER_NAME || inferWorkerName(url);
+  const workers = await cloudflarePaginatedRequest<WorkerRecord>(
+    token,
+    `/accounts/${config.account_id}/workers/scripts-search`,
+    100,
+  );
+  const instanceWorker = workers.find((worker) => worker.script_name === workerName || worker.service_name === workerName);
+  if (!instanceWorker) {
+    throw new HttpError(404, `Skywatch could not find the deployed Worker named ${workerName}.`, "worker_not_found");
+  }
+  const protection = await ensureSkywatchAccess(token, config.account_id, instanceWorker, owner.email);
+  return json({ protected: true, ...protection });
 }
 
 async function listWorkers(request: Request, env: RuntimeEnv): Promise<Response> {
@@ -446,6 +486,101 @@ async function verifyApiToken(token: string): Promise<void> {
   const data = await parseEnvelope<unknown>(response);
   if (!response.ok || !data.success) {
     throw new HttpError(401, "Cloudflare rejected this API token. Check the token and required permissions.", "token_verification_failed");
+  }
+}
+
+async function getTokenOwner(token: string): Promise<CloudflareUser> {
+  try {
+    const user = await cloudflareRequest<CloudflareUser>(token, "/user", { method: "GET" });
+    const email = user.email?.trim().toLowerCase();
+    if (!email || !isEmail(email)) {
+      throw new HttpError(502, "Cloudflare did not return a valid email for this token owner.", "owner_email_unavailable");
+    }
+    return { email };
+  } catch (error) {
+    if (error instanceof HttpError && error.status === 403) {
+      throw new HttpError(
+        403,
+        "Add User → User Details → Read to the API token so Skywatch can protect itself for your email.",
+        "user_details_permission_required",
+      );
+    }
+    throw error;
+  }
+}
+
+async function ensureSkywatchAccess(
+  token: string,
+  accountId: string,
+  worker: WorkerRecord,
+  ownerEmail: string,
+): Promise<{ appId: string; email: string }> {
+  const applications = await cloudflarePaginatedRequest<AccessApplication>(
+    token,
+    `/accounts/${accountId}/access/apps`,
+    100,
+  );
+  const existing = applications.find((app) =>
+    app.destinations?.some((destination) =>
+      destination.type === "worker"
+      && (destination.worker_id === worker.id
+        || destination.worker_id === worker.script_name
+        || destination.worker_id === worker.service_name),
+    ),
+  );
+  if (existing) return { appId: existing.id, email: ownerEmail };
+
+  const policyName = `${managedAppName(worker.script_name)} · owner`;
+  const policies = await cloudflarePaginatedRequest<AccessReusablePolicy>(
+    token,
+    `/accounts/${accountId}/access/policies`,
+    100,
+  );
+  let policy = policies.find((candidate) =>
+    candidate.name === policyName
+    && candidate.decision === "allow"
+    && extractEmails(candidate).length === 1
+    && extractEmails(candidate)[0] === ownerEmail,
+  );
+  let policyCreated = false;
+  if (!policy) {
+    policy = await cloudflareRequest<AccessReusablePolicy>(token, `/accounts/${accountId}/access/policies`, {
+      method: "POST",
+      body: {
+        name: policyName,
+        decision: "allow",
+        include: [{ email: { email: ownerEmail } }],
+        session_duration: "24h",
+      },
+    });
+    policyCreated = true;
+  }
+  if (!policy.id) throw new HttpError(502, "Cloudflare did not return the owner Access policy ID.", "access_policy_failed");
+
+  try {
+    const app = await cloudflareRequest<AccessApplication>(token, `/accounts/${accountId}/access/apps`, {
+      method: "POST",
+      body: {
+        name: managedAppName(worker.script_name),
+        type: "self_hosted",
+        session_duration: "24h",
+        app_launcher_visible: true,
+        http_only_cookie_attribute: true,
+        destinations: [{ type: "worker", worker_id: worker.id }],
+        policies: [{ id: policy.id, precedence: 1 }],
+      },
+    });
+    return { appId: app.id, email: ownerEmail };
+  } catch (error) {
+    if (policyCreated) {
+      await optionalCloudflareRequest(
+        token,
+        `/accounts/${accountId}/access/policies/${policy.id}`,
+        { method: "DELETE" },
+        null,
+      );
+    }
+    throw error;
   }
 }
 

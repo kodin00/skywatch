@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowRight,
   Check,
@@ -9,7 +9,6 @@ import {
   KeyRound,
   LayoutGrid,
   LockKeyhole,
-  LogOut,
   Menu,
   MoreHorizontal,
   RefreshCw,
@@ -61,6 +60,7 @@ const setupTasks = [
   { label: 'Connect this Skywatch instance', icon: Cloud },
   { label: 'Create key and encrypt API token', icon: KeyRound },
   { label: 'Sync Workers and Access rules', icon: ShieldCheck },
+  { label: 'Protect Skywatch for your email', icon: LockKeyhole },
 ]
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -89,6 +89,9 @@ function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnec
   const [task, setTask] = useState(-1)
   const [error, setError] = useState('')
   const [account, setAccount] = useState<{ id: string; name: string } | null>(null)
+  const [protectedEmail, setProtectedEmail] = useState('')
+  const [finalizing, setFinalizing] = useState(false)
+  const autoFinalizeStarted = useRef(false)
   const isUnlock = mode === 'unlock'
 
   useEffect(() => {
@@ -112,11 +115,15 @@ function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnec
         onConnected(status)
         return
       }
-      const result = await api<{ account: { id: string; name: string } }>('/api/setup', {
+      const result = await api<{
+        account: { id: string; name: string }
+        protection: { email: string; pending: boolean }
+      }>('/api/setup', {
         method: 'POST',
         body: JSON.stringify({ token: cleanToken }),
       })
       setAccount(result.account)
+      setProtectedEmail(result.protection.email)
       setTask(setupTasks.length)
       setState('complete')
       setToken('')
@@ -129,20 +136,38 @@ function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnec
 
   const finish = async () => {
     setError('')
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      const status = await api<StatusResponse>('/api/status')
-      if (status.encryption === 'ready') {
-        onConnected(status)
-        return
+    setFinalizing(true)
+    try {
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        const status = await api<StatusResponse>('/api/status')
+        if (status.encryption === 'ready') {
+          if (protectedEmail) {
+            await api('/api/protect-self', { method: 'POST', body: '{}' })
+            window.location.reload()
+            return
+          }
+          onConnected(status)
+          return
+        }
+        if (status.encryption === 'mismatch') {
+          setError('The stored token and Worker encryption key do not match. Reset the broken configuration before retrying setup.')
+          return
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 1200))
       }
-      if (status.encryption === 'mismatch') {
-        setError('The stored token and Worker encryption key do not match. Reset the broken configuration before retrying setup.')
-        return
-      }
-      await new Promise((resolve) => window.setTimeout(resolve, 1200))
+      setError('Cloudflare is still attaching the encryption key. Wait a few seconds, then try again.')
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Skywatch could not enable Cloudflare Access.')
+    } finally {
+      setFinalizing(false)
     }
-    setError('Cloudflare is still attaching the encryption key. Wait a few seconds, then try again.')
   }
+
+  useEffect(() => {
+    if (state !== 'complete' || !protectedEmail || autoFinalizeStarted.current) return
+    autoFinalizeStarted.current = true
+    void finish()
+  }, [state, protectedEmail])
 
   return (
     <main className="setup-shell">
@@ -163,6 +188,7 @@ function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnec
                   <div className="permission-row"><span>Account</span><strong>Access: Apps and Policies</strong><em>Edit</em></div>
                   <div className="permission-row"><span>Account</span><strong>Access: Audit Logs</strong><em>Read</em></div>
                   <div className="permission-row"><span>User</span><strong>Memberships</strong><em>Read</em></div>
+                  <div className="permission-row"><span>User</span><strong>User Details</strong><em>Read</em></div>
                   <div className="permission-row"><span>Resources</span><strong>Include</strong><em>One account</em></div>
                 </div>
                 <a className="create-token-button" href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noreferrer">Create token</a>
@@ -217,8 +243,9 @@ function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnec
               <p>The D1 vault is connected and your API token is encrypted with a Worker-only key.</p>
               <div className="connection-summary"><span><Database size={16} /> D1 vault</span><strong>Connected</strong></div>
               <div className="connection-summary"><span><Cloud size={16} /> Cloudflare</span><strong>{account?.name || 'Connected'}</strong></div>
+              <div className="connection-summary"><span><LockKeyhole size={16} /> Access owner</span><strong>{protectedEmail || 'Protected'}</strong></div>
               {error && <p className="form-error" role="alert">{error}</p>}
-              <button className="primary-button" type="button" onClick={() => void finish()}>Open dashboard <ArrowRight size={17} /></button>
+              <button className="primary-button" type="button" disabled={finalizing} onClick={() => void finish()}>{finalizing ? 'Enabling Access…' : 'Continue through Access'} <ArrowRight size={17} /></button>
             </div>
           )}
         </div>
@@ -278,7 +305,7 @@ function AccessDialog({ worker, onClose, onSaved }: { worker: Worker; onClose: (
   </div>
 }
 
-function Dashboard({ account, onLogout }: { account: { id: string; name: string }; onLogout: () => void }) {
+function Dashboard({ account }: { account: { id: string; name: string } }) {
   const [workers, setWorkers] = useState<Worker[]>([])
   const [seatUsage, setSeatUsage] = useState<SeatUsage | null>(null)
   const [syncedAt, setSyncedAt] = useState<string | null>(null)
@@ -321,8 +348,6 @@ function Dashboard({ account, onLogout }: { account: { id: string; name: string 
           <span className="nav-label">Workspace</span>
           <a className="nav-link active" href="#workers"><LayoutGrid size={17} /> Workers <span>{workers.length}</span></a>
           <a className="nav-link" href="#workers"><Users size={17} /> Access rules</a>
-          <span className="nav-label second">Manage</span>
-          <button className="nav-link nav-button" type="button" onClick={onLogout}><LogOut size={17} /> Lock Skywatch</button>
         </nav>
         <div className="sidebar-bottom">
           <div className="account-chip"><span className="avatar">{initials || 'CF'}</span><div><strong>{account.name}</strong><span>{account.id.slice(0, 10)}…</span></div><ChevronDown size={15} /></div>
@@ -415,14 +440,9 @@ export default function App() {
 
   useEffect(() => { void loadStatus() }, [])
 
-  const logout = async () => {
-    await api('/api/logout', { method: 'POST', body: '{}' })
-    setMode('unlock')
-  }
-
   if (bootError) return <main className="boot-state"><Logo /><h1>Skywatch could not start</h1><p>{bootError}</p><button type="button" onClick={() => void loadStatus()}>Try again</button></main>
   if (mode === 'loading') return <main className="boot-state"><Logo /><RefreshCw className="spin" size={23} /><p>Connecting the D1 vault…</p></main>
   if (mode === 'setup' || mode === 'unlock') return <SetupScreen mode={mode} onConnected={(next) => { setStatus(next); setMode('dashboard') }} />
   if (!status?.account) return <main className="boot-state"><Logo /><Settings size={23} /><p>Account details are unavailable.</p></main>
-  return <Dashboard account={status.account} onLogout={() => void logout()} />
+  return <Dashboard account={status.account} />
 }
