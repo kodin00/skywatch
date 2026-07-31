@@ -12,7 +12,9 @@
   },
   "d1_databases": [
     {
-      "binding": "DB"
+      "binding": "DB",
+      "database_name": "skywatch",
+      "database_id": "16ab3181-7893-4a8f-8c62-84d987b92a9d"
     }
   ],
   "vars": {
