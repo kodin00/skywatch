@@ -567,13 +567,14 @@ async function getSeatUsage(token: string, accountId: string): Promise<SeatUsage
     };
   } catch (error) {
     console.warn({ event: "seat_usage_unavailable", error: String(error) });
+    const detail = error instanceof HttpError ? ` Cloudflare response: ${error.message}` : "";
     return {
       available: false,
       used: null,
       limit: null,
       access: null,
       gateway: null,
-      message: "Add Zero Trust: PII Read to the API token to show active seat usage.",
+      message: `Add Account → Access: Audit Logs → Read to the API token, then refresh.${detail}`,
     };
   }
 }

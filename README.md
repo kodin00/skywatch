@@ -19,10 +19,10 @@ Create a custom token scoped to exactly one Cloudflare account:
 - Account → Workers Scripts → Read
 - Account → Workers Scripts → Edit
 - Account → Access: Apps and Policies → Edit
-- Account → Zero Trust: PII → Read
+- Account → Access: Audit Logs → Read
 - User → Memberships → Read
 
-Workers Scripts Edit is required once during setup so Skywatch can add its own non-readable encryption-key binding. Zero Trust PII Read is used only to count active Access and Gateway seats; user records are counted inside the Worker and are not returned to the browser. Access edits are limited to applications named and created by Skywatch; existing Access applications are displayed but not overwritten.
+Workers Scripts Edit is required once during setup so Skywatch can add its own non-readable encryption-key binding. Access Audit Logs Read is used only to count active Access and Gateway seats; user records are counted inside the Worker and are not returned to the browser. Access edits are limited to applications named and created by Skywatch; existing Access applications are displayed but not overwritten.
 
 ## Deploy
 

@@ -161,7 +161,7 @@ function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnec
                 <div className="permission-list">
                   <div className="permission-row"><span>Account</span><strong>Workers Scripts</strong><em>Read + Edit</em></div>
                   <div className="permission-row"><span>Account</span><strong>Access: Apps and Policies</strong><em>Edit</em></div>
-                  <div className="permission-row"><span>Account</span><strong>Zero Trust: PII</strong><em>Read</em></div>
+                  <div className="permission-row"><span>Account</span><strong>Access: Audit Logs</strong><em>Read</em></div>
                   <div className="permission-row"><span>User</span><strong>Memberships</strong><em>Read</em></div>
                   <div className="permission-row"><span>Resources</span><strong>Include</strong><em>One account</em></div>
                 </div>
