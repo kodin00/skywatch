@@ -44,7 +44,16 @@ type Worker = {
   managedBySkywatch: boolean
 }
 
-type WorkersResponse = { workers: Worker[]; syncedAt: string }
+type SeatUsage = {
+  available: boolean
+  used: number | null
+  limit: number | null
+  access: number | null
+  gateway: number | null
+  message?: string
+}
+
+type WorkersResponse = { workers: Worker[]; seatUsage: SeatUsage; syncedAt: string }
 type ApiError = { error?: string; code?: string }
 
 const setupTasks = [
@@ -148,6 +157,7 @@ function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnec
                 <div className="permission-list">
                   <div className="permission-row"><span>Account</span><strong>Workers Scripts</strong><em>Read + Edit</em></div>
                   <div className="permission-row"><span>Account</span><strong>Access: Apps and Policies</strong><em>Edit</em></div>
+                  <div className="permission-row"><span>Account</span><strong>Zero Trust: PII</strong><em>Read</em></div>
                   <div className="permission-row"><span>User</span><strong>Memberships</strong><em>Read</em></div>
                   <div className="permission-row"><span>Resources</span><strong>Include</strong><em>One account</em></div>
                 </div>
@@ -266,6 +276,7 @@ function AccessDialog({ worker, onClose, onSaved }: { worker: Worker; onClose: (
 
 function Dashboard({ account, onLogout }: { account: { id: string; name: string }; onLogout: () => void }) {
   const [workers, setWorkers] = useState<Worker[]>([])
+  const [seatUsage, setSeatUsage] = useState<SeatUsage | null>(null)
   const [syncedAt, setSyncedAt] = useState<string | null>(null)
   const [query, setQuery] = useState('')
   const [mobileNav, setMobileNav] = useState(false)
@@ -280,6 +291,7 @@ function Dashboard({ account, onLogout }: { account: { id: string; name: string 
     try {
       const result = await api<WorkersResponse>('/api/workers')
       setWorkers(result.workers)
+      setSeatUsage(result.seatUsage)
       setSyncedAt(result.syncedAt)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Workers could not be loaded.')
@@ -295,7 +307,6 @@ function Dashboard({ account, onLogout }: { account: { id: string; name: string 
     && (worker.name.toLowerCase().includes(query.toLowerCase()) || worker.emails.some((email) => email.includes(query.toLowerCase()))),
   ), [filter, query, workers])
   const protectedCount = workers.filter((worker) => worker.accessStatus === 'protected').length
-  const identityCount = new Set(workers.flatMap((worker) => worker.emails)).size
   const initials = account.name.split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase()
 
   return (
@@ -332,7 +343,18 @@ function Dashboard({ account, onLogout }: { account: { id: string; name: string 
           <div className="overview-strip">
             <div><span className="strip-label">Services</span><strong>{String(workers.length).padStart(2, '0')}</strong><small>deployed Workers</small></div>
             <div><span className="strip-label">Access boundary</span><strong>{String(protectedCount).padStart(2, '0')} <em>/ {String(workers.length).padStart(2, '0')}</em></strong><small>Workers protected</small></div>
-            <div><span className="strip-label">Allowed identities</span><strong>{String(identityCount).padStart(2, '0')}</strong><small>unique email rules</small></div>
+            <div className="seat-usage" title={seatUsage?.message}>
+              <span className="strip-label">User limit usage</span>
+              <strong>
+                {seatUsage?.available ? String(seatUsage.used ?? 0).padStart(2, '0') : '—'}
+                {seatUsage?.available && seatUsage.limit !== null && <em> / {seatUsage.limit}</em>}
+              </strong>
+              <small>{seatUsage?.available
+                ? seatUsage.limit === null
+                  ? `${seatUsage.access ?? 0} Access · ${seatUsage.gateway ?? 0} Gateway seats`
+                  : `${Math.max(0, seatUsage.limit - (seatUsage.used ?? 0))} seats remaining`
+                : seatUsage?.message ?? 'reading active seats'}</small>
+            </div>
             <div className="access-rail-legend" aria-label="Access distribution">
               {workers.slice(0, 8).map((worker) => <span key={worker.id} className={`${worker.accessStatus}-segment`} />)}
               {workers.length === 0 && <span className="public-segment" />}

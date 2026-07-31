@@ -137,6 +137,7 @@ button { color: inherit; }
 .overview-strip strong { font-size: 27px; letter-spacing: -.04em; font-weight: 500; line-height: 1; }
 .overview-strip strong em { color: var(--faint); font-size: 15px; font-style: normal; }
 .overview-strip small { margin-top: 7px; color: var(--muted); font-size: 9px; }
+.seat-usage small { max-width: 190px; line-height: 1.45; }
 .overview-strip .access-rail-legend { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; align-content: center; }
 .access-rail-legend span { height: 31px; border-radius: 4px; }
 .protected-segment { background: var(--sage); }
@@ -255,7 +256,7 @@ button { color: inherit; }
   .overview-strip { grid-template-columns: 1fr 1fr; min-height: auto; margin-top: 32px; }
   .overview-strip > div { padding: 19px; }
   .overview-strip > div:nth-child(2) { border-right: 0; }
-  .overview-strip > div:nth-child(3) { display: none; }
+  .overview-strip > div:nth-child(3) { grid-column: 1 / -1; border-top: 1px solid var(--line-soft); border-right: 0; }
   .worker-card { grid-template-columns: minmax(0, 1fr) auto; gap: 16px; padding: 20px 8px 20px 17px; }
   .worker-primary { grid-column: 1; }
   .worker-access { grid-column: 2; align-items: flex-end; }

@@ -12,7 +12,13 @@ type ApiEnvelope<T> = {
   success: boolean;
   result: T;
   errors?: Array<{ code?: number; message?: string }>;
-  result_info?: { total_pages?: number };
+  result_info?: {
+    page?: number;
+    per_page?: number;
+    total_pages?: number;
+    count?: number;
+    total_count?: number;
+  };
 };
 
 type Account = { id: string; name: string };
@@ -20,9 +26,15 @@ type Membership = { account?: Account };
 type WorkerRecord = {
   id: string;
   script_name: string;
+  service_name?: string;
   created_on?: string;
   modified_on?: string;
 };
+type WorkerDomain = {
+  hostname?: string;
+  service?: string;
+};
+type WorkerSubdomain = { subdomain?: string };
 type AccessPolicy = {
   id?: string;
   name?: string;
@@ -35,8 +47,32 @@ type AccessApplication = {
   id: string;
   name?: string;
   domain?: string;
+  self_hosted_domains?: string[];
   destinations?: Array<{ type?: string; worker_id?: string; uri?: string }>;
   policies?: AccessPolicy[];
+};
+type AccessUser = {
+  access_seat?: boolean;
+  gateway_seat?: boolean;
+};
+type AccountSubscription = {
+  component_values?: Array<{
+    display_name?: string;
+    name?: string;
+    value?: number;
+  }>;
+  rate_plan?: {
+    id?: string;
+    public_name?: string;
+  };
+};
+type SeatUsage = {
+  available: boolean;
+  used: number | null;
+  limit: number | null;
+  access: number | null;
+  gateway: number | null;
+  message?: string;
 };
 type StoredConfiguration = {
   account_id: string;
@@ -237,14 +273,33 @@ async function listWorkers(request: Request, env: RuntimeEnv): Promise<Response>
   const config = await requireConfiguration(env.DB);
   const token = await decryptStoredToken(env);
 
-  const [workers, applications] = await Promise.all([
-    cloudflareRequest<WorkerRecord[]>(token, `/accounts/${config.account_id}/workers/scripts-search?per_page=100`, { method: "GET" }),
-    cloudflareRequest<AccessApplication[]>(token, `/accounts/${config.account_id}/access/apps?per_page=100`, { method: "GET" }),
+  const [workers, applications, domains, subdomain, seatUsage] = await Promise.all([
+    cloudflarePaginatedRequest<WorkerRecord>(token, `/accounts/${config.account_id}/workers/scripts-search`, 100),
+    cloudflarePaginatedRequest<AccessApplication>(token, `/accounts/${config.account_id}/access/apps`, 100),
+    optionalCloudflareRequest<WorkerDomain[]>(
+      token,
+      `/accounts/${config.account_id}/workers/domains`,
+      { method: "GET" },
+      [],
+    ),
+    optionalCloudflareRequest<WorkerSubdomain>(
+      token,
+      `/accounts/${config.account_id}/workers/subdomain`,
+      { method: "GET" },
+      {},
+    ),
+    getSeatUsage(token, config.account_id),
   ]);
 
-  const relevantApps = applications.filter((app) =>
-    app.destinations?.some((destination) => destination.type === "worker" || destination.type === "all_workers"),
-  );
+  const aliasesByWorker = new Map(workers.map((worker) => [
+    worker.id,
+    workerHostnames(worker, domains, subdomain.subdomain),
+  ]));
+  const appsByWorker = new Map(workers.map((worker) => [
+    worker.id,
+    applications.filter((app) => applicationProtectsWorker(app, worker, aliasesByWorker.get(worker.id) ?? [])),
+  ]));
+  const relevantApps = uniqueById([...appsByWorker.values()].flat());
   const policiesByApp = new Map<string, AccessPolicy[]>();
   await Promise.all(relevantApps.map(async (app) => {
     if (app.policies?.length) {
@@ -260,9 +315,7 @@ async function listWorkers(request: Request, env: RuntimeEnv): Promise<Response>
   }));
 
   const result = workers.map((worker) => {
-    const apps = relevantApps.filter((app) => app.destinations?.some((destination) =>
-      destination.type === "all_workers" || (destination.type === "worker" && destination.worker_id === worker.id),
-    ));
+    const apps = appsByWorker.get(worker.id) ?? [];
     const policies = apps.flatMap((app) => policiesByApp.get(app.id) ?? []);
     return {
       id: worker.id,
@@ -277,7 +330,7 @@ async function listWorkers(request: Request, env: RuntimeEnv): Promise<Response>
     };
   });
 
-  return json({ workers: result, syncedAt: new Date().toISOString() });
+  return json({ workers: result, seatUsage, syncedAt: new Date().toISOString() });
 }
 
 async function updateWorkerAccess(request: Request, env: RuntimeEnv, workerId: string): Promise<Response> {
@@ -304,14 +357,23 @@ async function updateWorkerAccess(request: Request, env: RuntimeEnv, workerId: s
   const worker = workers[0];
   if (!worker) throw new HttpError(404, "Worker not found.", "worker_not_found");
 
-  const applications = await cloudflareRequest<AccessApplication[]>(
-    token,
-    `/accounts/${config.account_id}/access/apps?per_page=100`,
-    { method: "GET" },
-  );
-  const matching = applications.filter((app) => app.destinations?.some((destination) =>
-    destination.type === "worker" && destination.worker_id === worker.id,
-  ));
+  const [applications, domains, subdomain] = await Promise.all([
+    cloudflarePaginatedRequest<AccessApplication>(token, `/accounts/${config.account_id}/access/apps`, 100),
+    optionalCloudflareRequest<WorkerDomain[]>(
+      token,
+      `/accounts/${config.account_id}/workers/domains`,
+      { method: "GET" },
+      [],
+    ),
+    optionalCloudflareRequest<WorkerSubdomain>(
+      token,
+      `/accounts/${config.account_id}/workers/subdomain`,
+      { method: "GET" },
+      {},
+    ),
+  ]);
+  const aliases = workerHostnames(worker, domains, subdomain.subdomain);
+  const matching = applications.filter((app) => applicationProtectsWorker(app, worker, aliases));
   const managed = matching.find((app) => app.name === managedAppName(worker.script_name));
 
   if (mode === "public") {
@@ -418,6 +480,14 @@ async function cloudflareRequest<T>(
   path: string,
   init: { method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; body?: unknown },
 ): Promise<T> {
+  return (await cloudflareEnvelopeRequest<T>(token, path, init)).result;
+}
+
+async function cloudflareEnvelopeRequest<T>(
+  token: string,
+  path: string,
+  init: { method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; body?: unknown },
+): Promise<ApiEnvelope<T>> {
   const response = await fetch(`${API_ROOT}${path}`, {
     method: init.method,
     headers: {
@@ -432,7 +502,86 @@ async function cloudflareRequest<T>(
     const status = response.status === 401 || response.status === 403 ? 403 : 502;
     throw new HttpError(status, message, "cloudflare_api_error");
   }
-  return data.result;
+  return data;
+}
+
+async function cloudflarePaginatedRequest<T>(token: string, path: string, perPage: number): Promise<T[]> {
+  const results: T[] = [];
+  for (let page = 1; page <= 100; page += 1) {
+    const separator = path.includes("?") ? "&" : "?";
+    const data = await cloudflareEnvelopeRequest<T[]>(
+      token,
+      `${path}${separator}page=${page}&per_page=${perPage}`,
+      { method: "GET" },
+    );
+    results.push(...data.result);
+    const totalPages = data.result_info?.total_pages;
+    if (typeof totalPages === "number" ? page >= totalPages : data.result.length < perPage) break;
+  }
+  return results;
+}
+
+async function optionalCloudflareRequest<T>(
+  token: string,
+  path: string,
+  init: { method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; body?: unknown },
+  fallback: T,
+): Promise<T> {
+  try {
+    return await cloudflareRequest<T>(token, path, init);
+  } catch (error) {
+    console.warn({ event: "optional_cloudflare_request_failed", path, error: String(error) });
+    return fallback;
+  }
+}
+
+async function getSeatUsage(token: string, accountId: string): Promise<SeatUsage> {
+  try {
+    const users = await cloudflarePaginatedRequest<AccessUser>(
+      token,
+      `/accounts/${accountId}/access/users`,
+      1000,
+    );
+    const subscriptions = await optionalCloudflareRequest<AccountSubscription[]>(
+      token,
+      `/accounts/${accountId}/subscriptions`,
+      { method: "GET" },
+      [],
+    );
+    const access = users.filter((user) => user.access_seat).length;
+    const gateway = users.filter((user) => user.gateway_seat).length;
+    const used = users.filter((user) => user.access_seat || user.gateway_seat).length;
+    return {
+      available: true,
+      used,
+      limit: findSeatLimit(subscriptions, used),
+      access,
+      gateway,
+    };
+  } catch (error) {
+    console.warn({ event: "seat_usage_unavailable", error: String(error) });
+    return {
+      available: false,
+      used: null,
+      limit: null,
+      access: null,
+      gateway: null,
+      message: "Add Zero Trust: PII Read to the API token to show active seat usage.",
+    };
+  }
+}
+
+function findSeatLimit(subscriptions: AccountSubscription[], used: number): number | null {
+  const zeroTrustSubscriptions = subscriptions.filter((subscription) => {
+    const plan = `${subscription.rate_plan?.id ?? ""} ${subscription.rate_plan?.public_name ?? ""}`.toLowerCase();
+    return /zero[ -]?trust|cloudflare one|teams|access|gateway/.test(plan);
+  });
+  const candidates = zeroTrustSubscriptions
+    .flatMap((subscription) => subscription.component_values ?? [])
+    .filter((component) => /seat|user/.test(`${component.name ?? ""} ${component.display_name ?? ""}`.toLowerCase()))
+    .map((component) => component.value)
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value) && value >= used);
+  return candidates.length ? Math.min(...candidates) : null;
 }
 
 async function parseEnvelope<T>(response: Response): Promise<ApiEnvelope<T>> {
@@ -495,6 +644,69 @@ async function requireAuthentication(request: Request, db: D1Database): Promise<
   if (!(await isAuthenticated(request, db))) {
     throw new HttpError(401, "Unlock Skywatch to continue.", "authentication_required");
   }
+}
+
+function workerHostnames(worker: WorkerRecord, domains: WorkerDomain[], accountSubdomain?: string): string[] {
+  const serviceNames = new Set([worker.id, worker.script_name, worker.service_name].filter(Boolean));
+  const hostnames = domains
+    .filter((domain) => domain.service && serviceNames.has(domain.service))
+    .map((domain) => normalizeHostname(domain.hostname));
+  const subdomain = normalizeHostname(accountSubdomain);
+  if (subdomain) {
+    hostnames.push(`${worker.script_name}.${subdomain}.workers.dev`);
+    if (worker.service_name && worker.service_name !== worker.script_name) {
+      hostnames.push(`${worker.service_name}.${subdomain}.workers.dev`);
+    }
+  }
+  return unique(hostnames.filter(Boolean));
+}
+
+function applicationProtectsWorker(app: AccessApplication, worker: WorkerRecord, hostnames: string[]): boolean {
+  if (app.destinations?.some((destination) => destination.type === "all_workers")) return true;
+  if (app.destinations?.some((destination) =>
+    destination.type === "worker"
+    && (
+      destination.worker_id === worker.id
+      || destination.worker_id === worker.script_name
+      || destination.worker_id === worker.service_name
+    ),
+  )) return true;
+
+  const protectedUris = [
+    app.domain,
+    ...(app.self_hosted_domains ?? []),
+    ...(app.destinations ?? [])
+      .filter((destination) => destination.type === "public")
+      .map((destination) => destination.uri),
+  ].filter((value): value is string => typeof value === "string" && value.length > 0);
+
+  return protectedUris.some((uri) => {
+    const pattern = normalizeHostname(uri);
+    if (!pattern) return false;
+    if (hostnames.some((hostname) => hostnameMatches(pattern, hostname))) return true;
+    const firstLabel = pattern.split(".")[0];
+    return pattern.endsWith(".workers.dev")
+      && (firstLabel === worker.script_name || firstLabel === worker.service_name);
+  });
+}
+
+function normalizeHostname(value: string | undefined): string {
+  if (!value) return "";
+  const withoutScheme = value.trim().toLowerCase().replace(/^[a-z][a-z0-9+.-]*:\/\//, "");
+  return withoutScheme.split("/")[0]?.split(":")[0]?.replace(/\.$/, "") ?? "";
+}
+
+function hostnameMatches(pattern: string, hostname: string): boolean {
+  if (!pattern.includes("*")) return pattern === hostname;
+  const expression = pattern
+    .split("*")
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join(".*");
+  return new RegExp(`^${expression}$`, "i").test(hostname);
+}
+
+function uniqueById<T extends { id: string }>(values: T[]): T[] {
+  return [...new Map(values.map((value) => [value.id, value])).values()];
 }
 
 function extractEmails(policy: AccessPolicy): string[] {

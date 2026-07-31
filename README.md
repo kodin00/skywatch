@@ -1,6 +1,6 @@
 # Skywatch
 
-Skywatch is a small, Cloudflare-native control plane for Workers and Cloudflare Access. It shows every Worker in an account, whether it is public or protected, and the email selectors attached to its Access policies. Access applications created by Skywatch can be switched between public and protected from the dashboard.
+Skywatch is a small, Cloudflare-native control plane for Workers and Cloudflare Access. It shows every Worker in an account, whether it is public or protected, the email selectors attached to its Access policies, and active Zero Trust seat usage. Access applications created by Skywatch can be switched between public and protected from the dashboard.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kodin00/skywatch)
 
@@ -19,9 +19,10 @@ Create a custom token scoped to exactly one Cloudflare account:
 - Account → Workers Scripts → Read
 - Account → Workers Scripts → Edit
 - Account → Access: Apps and Policies → Edit
+- Account → Zero Trust: PII → Read
 - User → Memberships → Read
 
-Workers Scripts Edit is required once during setup so Skywatch can add its own non-readable encryption-key binding. Access edits are limited to applications named and created by Skywatch; existing Access applications are displayed but not overwritten.
+Workers Scripts Edit is required once during setup so Skywatch can add its own non-readable encryption-key binding. Zero Trust PII Read is used only to count active Access and Gateway seats; user records are counted inside the Worker and are not returned to the browser. Access edits are limited to applications named and created by Skywatch; existing Access applications are displayed but not overwritten.
 
 ## Deploy
 
