@@ -17,6 +17,13 @@
       "database_id": "16ab3181-7893-4a8f-8c62-84d987b92a9d"
     }
   ],
+  "vpc_services": [
+    {
+      "binding": "VPS_AGENT",
+      "service_id": "019fbd14-f4a5-7ea1-99d2-477e2d4d37ec",
+      "remote": true
+    }
+  ],
   "vars": {
     "SKYWATCH_WORKER_NAME": "skywatch"
   },
