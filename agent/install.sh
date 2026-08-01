@@ -5,7 +5,7 @@ set -Eeuo pipefail
 readonly REPOSITORY="kodin00/skywatch"
 readonly SOURCE_REF="${SKYWATCH_REF:-master}"
 readonly RUST_IMAGE="rust:1.97.1-alpine"
-readonly RELEASE_TAG="${SKYWATCH_AGENT_VERSION:-agent-v0.1.0}"
+readonly RELEASE_TAG="${SKYWATCH_AGENT_VERSION:-agent-v0.1.1}"
 readonly RELEASE_BASE="https://github.com/${REPOSITORY}/releases/download/${RELEASE_TAG}"
 readonly AGENT_USER="skywatch-agent"
 readonly AGENT_GROUP="skywatch-agent"

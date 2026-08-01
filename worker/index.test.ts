@@ -133,3 +133,47 @@ describe("agent transport selection", () => {
     expect(__test.selectAgentTransport("direct")).toBe("direct");
   });
 });
+
+describe("agent response normalization", () => {
+  it("sorts concurrently sampled containers by name and ID", () => {
+    const config = {
+      transport: "direct",
+      endpoint: "https://agent.example.com",
+      allow_insecure_http: 0,
+      node_id: KEY_ID,
+      node_name: "vps-01",
+      agent_version: "0.1.1",
+      key_id: KEY_ID,
+      key_ciphertext: "encrypted",
+      key_iv: "iv",
+      connected_at: "2026-08-01T00:00:00.000Z",
+      updated_at: "2026-08-01T00:00:00.000Z",
+    } as const;
+    const container = (name: string, id: string) => ({
+      id,
+      name,
+      image: "example/image:latest",
+      state: "running",
+      status: "Up 1 minute",
+      health: null,
+      createdAt: 1_700_000_000,
+      ports: [],
+      stats: null,
+    });
+
+    const normalized = __test.normalizeAgentPayload("/v1/containers", {
+      containers: [
+        container("web", "b".repeat(64)),
+        container("api", "c".repeat(64)),
+        container("api", "a".repeat(64)),
+      ],
+      collectedAt: "2026-08-01T00:00:00.000Z",
+    }, config) as { containers: Array<{ id: string; name: string }> };
+
+    expect(normalized.containers.map(({ id }) => id)).toEqual([
+      "a".repeat(64),
+      "c".repeat(64),
+      "b".repeat(64),
+    ]);
+  });
+});

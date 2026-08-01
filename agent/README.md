@@ -20,7 +20,8 @@ The agent binds to 127.0.0.1:8788 by default. Releases include static Linux bina
 x86_64 and arm64. If a release asset is temporarily unavailable, the installer falls
 back to building with the pinned Rust Docker image. Review [`install.sh`](./install.sh)
 before piping it to a root shell if you have not audited this repository. Re-running the
-installer updates the binary and preserves the existing node UUID and pairing key.
+installer updates the binary and systemd unit, restarts the service, and preserves the existing
+node UUID and pairing key.
 
 Release assets are built by [the agent release workflow](../.github/workflows/agent-release.yml)
 when an `agent-v*` tag is pushed. Unlike temporary Actions artifacts, they remain attached

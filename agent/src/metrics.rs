@@ -151,7 +151,7 @@ impl MetricsSampler {
         };
         self.docker_available.store(true, Ordering::Relaxed);
         let docker_for_stats = docker.clone();
-        let containers = stream::iter(containers.into_iter().map(move |mut container| {
+        let mut containers = stream::iter(containers.into_iter().map(move |mut container| {
             let docker = docker_for_stats.clone();
             async move {
                 if container.state.eq_ignore_ascii_case("running")
@@ -166,6 +166,7 @@ impl MetricsSampler {
         .buffer_unordered(stats_concurrency)
         .collect::<Vec<_>>()
         .await;
+        sort_containers(&mut containers);
         let sampled_at = now_rfc3339();
         *self.containers.write().await = ContainersResponse {
             sampled_at: sampled_at.clone(),
@@ -175,8 +176,62 @@ impl MetricsSampler {
     }
 }
 
+fn sort_containers(containers: &mut [crate::models::ContainerSummary]) {
+    containers.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
 pub fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::ContainerSummary;
+
+    #[test]
+    fn container_order_is_stable_by_name_then_id() {
+        let mut containers = vec![
+            ContainerSummary {
+                id: "b".repeat(64),
+                name: "web".into(),
+                ..ContainerSummary::default()
+            },
+            ContainerSummary {
+                id: "c".repeat(64),
+                name: "API".into(),
+                ..ContainerSummary::default()
+            },
+            ContainerSummary {
+                id: "a".repeat(64),
+                name: "api".into(),
+                ..ContainerSummary::default()
+            },
+        ];
+
+        sort_containers(&mut containers);
+
+        assert_eq!(
+            containers
+                .iter()
+                .map(|container| container.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c".repeat(64), "a".repeat(64), "b".repeat(64)]
+        );
+    }
+
+    #[test]
+    fn systemd_sandbox_keeps_host_metric_proc_files_visible() {
+        let unit = include_str!("../packaging/systemd/skywatch-agent.service");
+        assert!(unit.contains("ProtectProc=invisible"));
+        assert!(!unit.contains("ProcSubset=pid"));
+    }
 }

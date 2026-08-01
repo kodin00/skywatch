@@ -30,7 +30,8 @@ ProtectKernelLogs=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectProc=invisible
-ProcSubset=pid
+# Host metrics require the system-wide files in /proc (stat, meminfo, loadavg, uptime).
+# ProtectProc still hides other users' process directories without removing those files.
 LockPersonality=true
 MemoryDenyWriteExecute=true
 RestrictRealtime=true

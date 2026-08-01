@@ -1141,8 +1141,10 @@ function normalizeAgentPayload(pathAndQuery: string, payload: unknown, config: S
   }
   if (pathAndQuery === "/v1/system") return normalizeAgentSystem(payload, config);
   if (pathAndQuery === "/v1/containers") {
+    const containers = arrayValue(payload.containers).map(normalizeContainerSummary);
+    containers.sort(compareNormalizedContainers);
     return {
-      containers: arrayValue(payload.containers).map(normalizeContainerSummary),
+      containers,
       collectedAt: typeof payload.collectedAt === "string"
         ? payload.collectedAt
         : stringValue(payload.sampledAt),
@@ -1163,6 +1165,24 @@ function normalizeAgentPayload(pathAndQuery: string, payload: unknown, config: S
     return { container: normalizeContainerInspect(payload), collectedAt: new Date().toISOString() };
   }
   return payload;
+}
+
+function compareNormalizedContainers(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+): number {
+  const leftName = stringValue(left.name);
+  const rightName = stringValue(right.name);
+  const folded = compareText(leftName.toLowerCase(), rightName.toLowerCase());
+  if (folded !== 0) return folded;
+  const exact = compareText(leftName, rightName);
+  if (exact !== 0) return exact;
+  return compareText(stringValue(left.id), stringValue(right.id));
+}
+
+function compareText(left: string, right: string): number {
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
 }
 
 function normalizeAgentSystem(payload: Record<string, unknown>, config: StoredAgentConfiguration): unknown {
@@ -2065,6 +2085,7 @@ export const __test = {
   validateAgentEndpoint,
   parsePairingToken,
   parseAgentNode,
+  normalizeAgentPayload,
   agentConfigurationResponse,
   agentRequestCanonical,
   agentResponseCanonical,
