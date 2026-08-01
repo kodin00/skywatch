@@ -10,16 +10,21 @@ controller can ask for, but it does not make membership in the docker group unpr
 
 ## One-line installation
 
-On a Linux VPS with Docker and systemd, this command downloads the repository, builds the
-pinned Rust toolchain inside Docker, installs the hardened service, starts it, and prints
-the pairing key:
+On a Linux VPS with Docker and systemd, this command downloads a checksum-verified static
+binary from the current versioned GitHub Release, installs the hardened service, starts it, and
+prints the pairing key:
 
     curl -fsSL https://raw.githubusercontent.com/kodin00/skywatch/master/agent/install.sh | sudo bash
 
-The agent binds to 127.0.0.1:8788 by default. The build can take a few minutes on a small
-VPS. Review [`install.sh`](./install.sh) before piping it to a root shell if you have not
-audited this repository. Re-running the installer updates the binary and preserves the
-existing node UUID and pairing key.
+The agent binds to 127.0.0.1:8788 by default. Releases include static Linux binaries for
+x86_64 and arm64. If a release asset is temporarily unavailable, the installer falls
+back to building with the pinned Rust Docker image. Review [`install.sh`](./install.sh)
+before piping it to a root shell if you have not audited this repository. Re-running the
+installer updates the binary and preserves the existing node UUID and pairing key.
+
+Release assets are built by [the agent release workflow](../.github/workflows/agent-release.yml)
+when an `agent-v*` tag is pushed. Unlike temporary Actions artifacts, they remain attached
+to the versioned GitHub Release along with their SHA-256 files.
 
 ## Build and initialize
 

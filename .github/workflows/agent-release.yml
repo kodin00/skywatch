@@ -1,0 +1,99 @@
+name: Release VPS agent
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "agent-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --target "${{ matrix.target }}"
+
+      - name: Install the musl linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
+
+      - name: Build the static agent
+        run: cargo +1.97.1 build --locked --release --target "${{ matrix.target }}" --manifest-path agent/Cargo.toml
+
+      - name: Verify and package the binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -Eeuo pipefail
+          binary="agent/target/${TARGET}/release/skywatch-agent"
+          file "${binary}"
+          file "${binary}" | grep -q "statically linked"
+          "${binary}" --version
+          asset="skywatch-agent-${TARGET}.tar.gz"
+          mkdir -p dist/package
+          cp "${binary}" dist/package/skywatch-agent
+          cp agent/packaging/systemd/skywatch-agent.service dist/package/skywatch-agent.service
+          tar -C dist/package -czf "dist/${asset}" skywatch-agent skywatch-agent.service
+          cd dist
+          sha256sum "${asset}" > "${asset}.sha256"
+
+      - name: Upload release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: skywatch-agent-${{ matrix.target }}
+          path: |
+            dist/skywatch-agent-${{ matrix.target }}.tar.gz
+            dist/skywatch-agent-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish GitHub Release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Download release files
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish versioned release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' agent/Cargo.toml | head -n 1)"
+          [[ "${RELEASE_TAG}" == "agent-v${version}" ]] || {
+            printf 'release tag %s does not match Cargo version %s\n' "${RELEASE_TAG}" "${version}" >&2
+            exit 1
+          }
+          gh release create "${RELEASE_TAG}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --latest \
+            --title "Skywatch Agent ${version}" \
+            --notes "Static Linux binaries for x86_64 and arm64. Verify the downloaded archive with its adjacent SHA-256 file."

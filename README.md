@@ -75,7 +75,7 @@ On a Linux VPS with Docker and systemd, install and start it with:
 curl -fsSL https://raw.githubusercontent.com/kodin00/skywatch/master/agent/install.sh | sudo bash
 ```
 
-The installer builds with the pinned Rust toolchain inside Docker, installs the hardened systemd service, and prints the pairing key needed by the Servers view. It binds to `127.0.0.1:8788` unless explicitly configured otherwise.
+The installer downloads a checksum-verified static binary from the current versioned GitHub Release, installs the hardened systemd service, and prints the pairing key needed by the Servers view. It binds to `127.0.0.1:8788` unless explicitly configured otherwise. If a release is temporarily unavailable, it falls back to a pinned Docker build.
 
 - **Workers VPC Service:** private Worker-to-agent routing through `cloudflared`. The agent can remain on `127.0.0.1:8788`.
 - **Public Cloudflare Tunnel URL:** normal HTTPS `fetch()` through a public tunnel hostname to the same loopback listener.
