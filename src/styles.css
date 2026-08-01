@@ -28,11 +28,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 button { color: inherit; }
 
 .brand { display: flex; align-items: center; gap: 11px; font-weight: 700; font-size: 17px; letter-spacing: -0.03em; }
-.brand-mark { width: 29px; height: 29px; border: 1px solid #56605f; border-radius: 9px; position: relative; overflow: hidden; background: #303639; }
-.brand-mark::before, .brand-mark::after, .brand-mark span { content: ''; position: absolute; height: 1.5px; border-radius: 4px; left: 6px; background: var(--text); transform: rotate(-8deg); }
-.brand-mark::before { width: 18px; top: 9px; background: var(--sage); }
-.brand-mark span { width: 14px; top: 14px; left: 9px; }
-.brand-mark::after { width: 9px; top: 19px; left: 13px; opacity: .55; }
+.brand-mark { width: 29px; height: 29px; display: grid; place-items: center; overflow: hidden; }
+.brand-mark img { width: 100%; height: 100%; display: block; object-fit: contain; }
 .eyebrow { display: flex; align-items: center; gap: 8px; color: var(--sage); font-family: 'DM Mono', monospace; font-size: 10px; font-weight: 500; letter-spacing: .12em; text-transform: uppercase; }
 .eyebrow > span { width: 5px; height: 5px; border-radius: 50%; background: var(--sage); box-shadow: 0 0 0 4px var(--sage-wash); }
 .eyebrow.centered { justify-content: center; }
@@ -94,19 +91,17 @@ button { color: inherit; }
 .sidebar nav { padding: 26px 12px; }
 .nav-label { display: block; margin: 0 12px 10px; color: #697471; font-family: 'DM Mono', monospace; font-size: 8.5px; letter-spacing: .12em; text-transform: uppercase; }
 .nav-label.second { margin-top: 31px; }
-.nav-link { height: 41px; padding: 0 12px; display: flex; align-items: center; gap: 11px; color: var(--muted); border: 1px solid transparent; border-radius: 9px; text-decoration: none; font-size: 12px; font-weight: 500; margin: 3px 0; }
-.nav-link:hover { color: var(--text); }
+.nav-link { height: 41px; padding: 0 12px; display: flex; align-items: center; gap: 11px; color: #b7c0bd; border: 1px solid transparent; border-radius: 9px; text-decoration: none; font-size: 12px; font-weight: 560; margin: 3px 0; }
+.nav-link:hover { color: var(--text); background: rgba(255,255,255,.035); }
 .nav-link.active { color: var(--text); background: #303639; border-color: #3c4346; }
 .nav-link.active svg { color: var(--sage); }
 .nav-link > span { margin-left: auto; min-width: 21px; height: 18px; display: grid; place-items: center; color: var(--sage); border-radius: 5px; background: var(--sage-wash); font-family: 'DM Mono', monospace; font-size: 9px; }
 .nav-button { width: 100%; cursor: pointer; text-align: left; }
 .sidebar-bottom { margin-top: auto; padding: 14px 12px 19px; border-top: 1px solid var(--line-soft); }
-.account-chip { padding: 9px 10px; display: flex; align-items: center; gap: 10px; }
-.avatar { width: 32px; height: 32px; display: grid; place-items: center; flex: none; border-radius: 9px; color: #28322d; background: #acc8ba; font-size: 9px; font-weight: 700; }
+.account-chip { padding: 9px 10px; display: flex; align-items: center; }
 .account-chip div { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
 .account-chip strong { color: #dbe0de; font-size: 11px; }
 .account-chip div span { color: var(--faint); font-size: 8.5px; }
-.account-chip > svg { color: var(--faint); }
 .sync-state { margin: 13px 10px 0; padding-top: 14px; border-top: 1px solid var(--line-soft); display: flex; gap: 9px; align-items: center; color: var(--faint); font-size: 8.5px; }
 .sync-state > span:first-child { width: 6px; height: 6px; border-radius: 50%; background: var(--sage); box-shadow: 0 0 0 3px var(--sage-wash); }
 .sync-state > span:last-child { display: flex; flex-direction: column; gap: 2px; }

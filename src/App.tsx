@@ -5,7 +5,6 @@ import {
   ArrowRight,
   Box,
   Check,
-  ChevronDown,
   Cloud,
   Cpu,
   Database,
@@ -28,7 +27,6 @@ import {
   Square,
   Terminal,
   Trash2,
-  Users,
   Wifi,
   WifiOff,
   X,
@@ -133,7 +131,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 function Logo() {
   return (
     <div className="brand" aria-label="Skywatch">
-      <span className="brand-mark" aria-hidden="true"><span /></span>
+      <span className="brand-mark" aria-hidden="true"><img src="/skywatch-cloud-eye.png" alt="" /></span>
       <span>skywatch</span>
     </div>
   )
@@ -730,7 +728,7 @@ function ServersDashboard() {
 
   return <div className="content servers-content">
     <div className="page-heading servers-heading">
-      <div><span className="eyebrow"><span /> Host control plane</span><h1>Servers</h1><p>Switch between registered nodes without mixing their metrics, logs, or controls.</p></div>
+      <div><h1>Servers</h1><p>Switch between registered nodes without mixing their metrics, logs, or controls.</p></div>
       <button className="secondary-button add-server-button" type="button" onClick={() => setFormMode('add')}><Plus size={16} /> Add server</button>
     </div>
 
@@ -755,7 +753,6 @@ function Dashboard({ account }: { account: { id: string; name: string } }) {
   const [workers, setWorkers] = useState<Worker[]>([])
   const [seatUsage, setSeatUsage] = useState<SeatUsage | null>(null)
   const [syncedAt, setSyncedAt] = useState<string | null>(null)
-  const [query, setQuery] = useState('')
   const [mobileNav, setMobileNav] = useState(false)
   const [filter, setFilter] = useState<'all' | AccessType>('all')
   const [loading, setLoading] = useState(true)
@@ -780,11 +777,9 @@ function Dashboard({ account }: { account: { id: string; name: string } }) {
   useEffect(() => { void loadWorkers() }, [])
 
   const filtered = useMemo(() => workers.filter((worker) =>
-    (filter === 'all' || worker.accessStatus === filter)
-    && (worker.name.toLowerCase().includes(query.toLowerCase()) || worker.emails.some((email) => email.includes(query.toLowerCase()))),
-  ), [filter, query, workers])
+    filter === 'all' || worker.accessStatus === filter,
+  ), [filter, workers])
   const protectedCount = workers.filter((worker) => worker.accessStatus === 'protected').length
-  const initials = account.name.split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase()
 
   return (
     <main className="app-shell">
@@ -794,10 +789,9 @@ function Dashboard({ account }: { account: { id: string; name: string } }) {
           <span className="nav-label">Workspace</span>
           <button className={`nav-link nav-button ${section === 'workers' ? 'active' : ''}`} type="button" onClick={() => { setSection('workers'); setMobileNav(false) }}><LayoutGrid size={17} /> Workers <span>{workers.length}</span></button>
           <button className={`nav-link nav-button ${section === 'servers' ? 'active' : ''}`} type="button" onClick={() => { setSection('servers'); setMobileNav(false) }}><Server size={17} /> Servers</button>
-          <button className="nav-link nav-button" type="button" onClick={() => { setSection('workers'); setFilter('all'); setMobileNav(false) }}><Users size={17} /> Access rules</button>
         </nav>
         <div className="sidebar-bottom">
-          <div className="account-chip"><span className="avatar">{initials || 'CF'}</span><div><strong>{account.name}</strong><span>{account.id.slice(0, 10)}…</span></div><ChevronDown size={15} /></div>
+          <div className="account-chip"><div><strong>{account.name}</strong><span>{account.id.slice(0, 10)}…</span></div></div>
           <div className="sync-state"><span /><span><strong>Cloudflare {error ? 'needs attention' : 'synced'}</strong>{syncedAt ? relativeDate(syncedAt) : 'connecting'}</span></div>
         </div>
       </aside>
@@ -807,13 +801,13 @@ function Dashboard({ account }: { account: { id: string; name: string } }) {
         <header className="topbar">
           <button className="mobile-menu" type="button" onClick={() => setMobileNav(true)} aria-label="Open navigation"><Menu size={20} /></button>
           {section === 'workers'
-            ? <><div className="search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search Workers or emails" aria-label="Search Workers" /></div><div className="topbar-actions"><button className="secondary-button" type="button" disabled={loading} onClick={() => void loadWorkers()}><RefreshCw size={16} className={loading ? 'spin' : ''} /> Refresh</button></div></>
+            ? <div className="topbar-actions"><button className="secondary-button" type="button" disabled={loading} onClick={() => void loadWorkers()}><RefreshCw size={16} className={loading ? 'spin' : ''} /> Refresh</button></div>
             : <div className="topbar-section"><Server size={16} /><span>Server operations</span></div>}
         </header>
 
         {section === 'workers' ? <div className="content">
           <div className="page-heading">
-            <div><span className="eyebrow"><span /> Live inventory</span><h1>Workers</h1><p>Every service and its access boundary, in one place.</p></div>
+            <div><h1>Workers</h1><p>Every service and its access boundary, in one place.</p></div>
             <div className="sync-pill"><span className="pulse" /> {syncedAt ? `Synced ${relativeDate(syncedAt)}` : 'Connecting'}</div>
           </div>
 
@@ -861,7 +855,7 @@ function Dashboard({ account }: { account: { id: string; name: string } }) {
                 <div className="worker-actions"><span>Updated {relativeDate(worker.modifiedAt)}</span><button type="button" onClick={() => setSelected(worker)} aria-label={`Manage access for ${worker.name}`}><MoreHorizontal size={19} /></button></div>
               </article>
             ))}
-            {!loading && filtered.length === 0 && !error && <div className="empty-state"><Search size={22} /><h2>No Workers found</h2><p>Try another search or access filter.</p></div>}
+            {!loading && filtered.length === 0 && !error && <div className="empty-state"><Search size={22} /><h2>No Workers found</h2><p>Try a different access filter.</p></div>}
           </div>
         </div> : <ServersDashboard />}
       </section>
