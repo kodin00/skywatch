@@ -215,6 +215,30 @@ button { color: inherit; }
 .topbar-section svg { color: var(--sage); }
 .servers-content { padding-bottom: 90px; }
 .servers-heading { align-items: center; }
+.add-server-button { flex: none; }
+.server-fleet { margin-top: 37px; display: grid; grid-template-columns: 130px minmax(0, 1fr); min-height: 92px; overflow: hidden; background: #282d30; border: 1px solid var(--line); border-radius: 14px; }
+.server-fleet > header { padding: 17px; display: flex; flex-direction: column; justify-content: center; border-right: 1px solid var(--line-soft); }
+.server-fleet > header span { color: var(--faint); font-family: 'DM Mono', monospace; font-size: 7.5px; letter-spacing: .08em; text-transform: uppercase; }
+.server-fleet > header strong { margin-top: 5px; color: var(--text); font-size: 24px; font-weight: 500; letter-spacing: -.04em; }
+.server-fleet > header small { margin-top: 4px; color: var(--faint); font-size: 7px; line-height: 1.4; }
+.server-rack { min-width: 0; padding: 10px; display: flex; gap: 8px; overflow-x: auto; scrollbar-width: thin; scrollbar-color: #56605f transparent; }
+.server-rack > button { min-width: 205px; min-height: 70px; padding: 11px 12px; display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; align-items: center; gap: 10px; color: var(--muted); background: #2d3336; border: 1px solid var(--line-soft); border-radius: 9px; cursor: pointer; text-align: left; transition: border-color .2s, background .2s, transform .2s; }
+.server-rack > button:hover { border-color: #56605f; transform: translateY(-1px); }
+.server-rack > button.active { color: var(--sage); background: var(--sage-wash); border-color: var(--sage-deep); }
+.server-rack > button > i { width: 6px; height: 6px; border-radius: 50%; background: #68726f; box-shadow: 0 0 0 4px rgba(104,114,111,.1); }
+.server-rack > button.active > i { background: var(--sage); box-shadow: 0 0 0 4px var(--sage-wash); }
+.server-rack > button > span { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.server-rack > button strong { overflow: hidden; color: #dce2df; font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.server-rack > button small { color: var(--faint); font-family: 'DM Mono', monospace; font-size: 7.5px; }
+.server-rack > button em { align-self: start; color: var(--faint); font-family: 'DM Mono', monospace; font-size: 7px; font-style: normal; }
+.server-rack-empty { min-width: 250px; padding: 0 13px; display: flex; align-items: center; gap: 11px; color: var(--faint); }
+.server-rack-empty span { display: flex; flex-direction: column; gap: 4px; }
+.server-rack-empty strong { color: #c7cecb; font-size: 10px; }
+.server-rack-empty small { font-size: 8px; }
+.selected-server-status { margin-top: 26px; display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+.selected-server-status > div:first-child { min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.selected-server-status > div:first-child > strong { overflow: hidden; color: var(--text); font-size: 18px; text-overflow: ellipsis; white-space: nowrap; }
+.selected-server-status + .agent-connection-card { margin-top: 12px; }
 .agent-state { min-width: 178px; padding: 10px 12px; display: flex; align-items: center; gap: 10px; color: var(--sage); background: var(--sage-wash); border: 1px solid rgba(169,212,189,.2); border-radius: 10px; }
 .agent-state.degraded { color: #d8bda5; background: rgba(196,139,106,.09); border-color: rgba(196,139,106,.23); }
 .agent-state > span { display: flex; flex-direction: column; gap: 2px; color: var(--faint); font-family: 'DM Mono', monospace; font-size: 8px; }
@@ -241,6 +265,7 @@ button { color: inherit; }
 .transport-switch { margin-top: 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .transport-switch button { position: relative; min-height: 82px; padding: 15px; display: flex; align-items: flex-start; gap: 11px; color: var(--muted); background: #292e31; border: 1px solid var(--line-soft); border-radius: 11px; cursor: pointer; text-align: left; }
 .transport-switch button.active { color: var(--sage); background: var(--sage-wash); border-color: var(--sage-deep); }
+.transport-switch button:disabled { cursor: not-allowed; opacity: .48; }
 .transport-switch button > span { display: flex; flex-direction: column; gap: 5px; }
 .transport-switch strong { color: #dbe1de; font-size: 11px; }
 .transport-switch small { color: var(--faint); font-size: 8.5px; }
@@ -375,6 +400,11 @@ button { color: inherit; }
   .email-list { flex-direction: row; }
   .email-list span:nth-child(2) { display: none; }
   .servers-heading { align-items: flex-start; flex-direction: column; gap: 20px; }
+  .servers-heading .add-server-button { width: auto; padding: 0 14px; font-size: 10px; }
+  .server-fleet { margin-top: 28px; grid-template-columns: 1fr; }
+  .server-fleet > header { min-height: 70px; border-right: 0; border-bottom: 1px solid var(--line-soft); }
+  .server-rack > button { min-width: min(230px, 78vw); }
+  .selected-server-status { align-items: stretch; flex-direction: column; }
   .agent-state { width: 100%; }
   .agent-connection-card { grid-template-columns: 1fr auto; gap: 18px; margin-top: 29px; padding: 17px; }
   .agent-connection-card dl { grid-template-columns: 1fr; gap: 12px; }

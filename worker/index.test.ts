@@ -63,6 +63,7 @@ describe("agent endpoint validation", () => {
       connected_at: "2026-08-01T00:00:00.000Z",
       updated_at: "2026-08-01T00:00:00.000Z",
     });
+    expect(response.id).toBe(KEY_ID);
     expect(response.allowInsecureHttp).toBe(true);
   });
 });
@@ -131,6 +132,26 @@ describe("agent transport selection", () => {
   it("never falls back when the VPC binding is missing", () => {
     expect(thrownCode(() => __test.selectAgentTransport("vpc"))).toBe("agent_transport_unavailable");
     expect(__test.selectAgentTransport("direct")).toBe("direct");
+  });
+});
+
+describe("server-scoped agent routes", () => {
+  it("keeps server and container identities explicit in every live route", () => {
+    const containerId = "a".repeat(64);
+    expect(__test.matchServerRoute(`/api/servers/${KEY_ID}/system`)).toEqual({
+      serverId: KEY_ID,
+      resource: "system",
+      containerId: null,
+      operation: null,
+    });
+    expect(__test.matchServerRoute(`/api/servers/${KEY_ID}/containers/${containerId}/restart`)).toEqual({
+      serverId: KEY_ID,
+      resource: "containers",
+      containerId,
+      operation: "restart",
+    });
+    expect(thrownCode(() => __test.matchServerRoute("/api/servers/not-a-uuid/system")))
+      .toBe("invalid_server_id");
   });
 });
 

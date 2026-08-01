@@ -10,6 +10,7 @@ const AGENT_MAX_LOG_RESPONSE_BYTES = 1024 * 1024;
 const AGENT_READ_TIMEOUT_MS = 5_000;
 const AGENT_MUTATION_TIMEOUT_MS = 15_000;
 const AGENT_PAIR_TIMEOUT_MS = 5_000;
+const AGENT_MAX_SERVERS = 100;
 
 type RuntimeEnv = Cloudflare.Env & {
   SKYWATCH_TOKEN_KEY?: CryptoKey;
@@ -33,13 +34,13 @@ type StoredAgentConfiguration = {
   updated_at: string;
 };
 type AgentConfigResponse = {
-  configured: boolean;
-  transport: AgentTransportName | null;
-  endpoint: string | null;
+  id: string;
+  transport: AgentTransportName;
+  endpoint: string;
   allowInsecureHttp: boolean;
-  node: AgentNode | null;
-  connectedAt: string | null;
-  updatedAt: string | null;
+  node: AgentNode;
+  connectedAt: string;
+  updatedAt: string;
 };
 type AgentResponse<T> = { data: T; status: number };
 
@@ -161,39 +162,43 @@ export default {
         const workerId = decodeURIComponent(url.pathname.split("/")[3] ?? "");
         return withHeaders(await updateWorkerAccess(request, env, workerId));
       }
-      if (request.method === "GET" && url.pathname === "/api/agent/config") {
-        return withHeaders(await getAgentConfiguration(request, env));
+      if (url.pathname === "/api/servers" && request.method === "GET") {
+        return withHeaders(await listAgentConfigurations(request, env));
       }
-      if (request.method === "PUT" && url.pathname === "/api/agent/config") {
-        return withHeaders(await updateAgentConfiguration(request, env));
+      if (url.pathname === "/api/servers" && request.method === "POST") {
+        return withHeaders(await updateAgentConfiguration(request, env, null));
       }
-      if (request.method === "DELETE" && url.pathname === "/api/agent/config") {
-        return withHeaders(await deleteAgentConfiguration(request, env));
+      const serverRoute = matchServerRoute(url.pathname);
+      if (serverRoute?.resource === "config" && request.method === "PUT") {
+        return withHeaders(await updateAgentConfiguration(request, env, serverRoute.serverId));
       }
-      if (request.method === "GET" && url.pathname === "/api/agent/health") {
-        return withHeaders(await proxyAgentRead(request, env, "/v1/health"));
+      if (serverRoute?.resource === "config" && request.method === "DELETE") {
+        return withHeaders(await deleteAgentConfiguration(request, env, serverRoute.serverId));
       }
-      if (request.method === "GET" && url.pathname === "/api/agent/system") {
-        return withHeaders(await proxyAgentRead(request, env, "/v1/system"));
+      if (serverRoute?.resource === "health" && request.method === "GET") {
+        return withHeaders(await proxyAgentRead(request, env, serverRoute.serverId, "/v1/health"));
       }
-      if (request.method === "GET" && url.pathname === "/api/agent/containers") {
-        return withHeaders(await proxyAgentRead(request, env, "/v1/containers"));
+      if (serverRoute?.resource === "system" && request.method === "GET") {
+        return withHeaders(await proxyAgentRead(request, env, serverRoute.serverId, "/v1/system"));
       }
-      const containerRoute = matchContainerRoute(url.pathname);
-      if (containerRoute && request.method === "GET" && containerRoute.operation === "inspect") {
-        return withHeaders(await proxyAgentRead(request, env, `/v1/containers/${encodeURIComponent(containerRoute.id)}`));
+      if (serverRoute?.resource === "containers" && !serverRoute.containerId && request.method === "GET") {
+        return withHeaders(await proxyAgentRead(request, env, serverRoute.serverId, "/v1/containers"));
       }
-      if (containerRoute && request.method === "GET" && containerRoute.operation === "logs") {
+      if (serverRoute?.resource === "containers" && serverRoute.containerId && request.method === "GET" && serverRoute.operation === "inspect") {
+        return withHeaders(await proxyAgentRead(request, env, serverRoute.serverId, `/v1/containers/${encodeURIComponent(serverRoute.containerId)}`));
+      }
+      if (serverRoute?.resource === "containers" && serverRoute.containerId && request.method === "GET" && serverRoute.operation === "logs") {
         const tail = parseLogTail(url.searchParams.get("tail"));
         return withHeaders(await proxyAgentRead(
           request,
           env,
-          `/v1/containers/${encodeURIComponent(containerRoute.id)}/logs?tail=${tail}`,
+          serverRoute.serverId,
+          `/v1/containers/${encodeURIComponent(serverRoute.containerId)}/logs?tail=${tail}`,
           AGENT_MAX_LOG_RESPONSE_BYTES,
         ));
       }
-      if (containerRoute && request.method === "POST" && isContainerAction(containerRoute.operation)) {
-        return withHeaders(await proxyAgentMutation(request, env, containerRoute.id, containerRoute.operation));
+      if (serverRoute?.resource === "containers" && serverRoute.containerId && request.method === "POST" && isContainerAction(serverRoute.operation)) {
+        return withHeaders(await proxyAgentMutation(request, env, serverRoute.serverId, serverRoute.containerId, serverRoute.operation));
       }
 
       return withHeaders(json({ error: "Route not found", code: "not_found" }, 404));
@@ -250,6 +255,23 @@ async function ensureSchema(db: D1Database): Promise<void> {
       connected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS skywatch_agents (
+      node_id TEXT PRIMARY KEY,
+      transport TEXT NOT NULL CHECK (transport IN ('vpc', 'direct')),
+      endpoint TEXT NOT NULL,
+      allow_insecure_http INTEGER NOT NULL DEFAULT 0 CHECK (allow_insecure_http IN (0, 1)),
+      node_name TEXT NOT NULL,
+      agent_version TEXT NOT NULL,
+      key_id TEXT NOT NULL,
+      key_ciphertext TEXT NOT NULL,
+      key_iv TEXT NOT NULL,
+      connected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS skywatch_agent_migrations (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      migrated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`),
     db.prepare(`CREATE TABLE IF NOT EXISTS skywatch_agent_audit (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       request_id TEXT NOT NULL,
@@ -263,6 +285,17 @@ async function ensureSchema(db: D1Database): Promise<void> {
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )`),
     db.prepare("CREATE INDEX IF NOT EXISTS idx_skywatch_agent_audit_created_at ON skywatch_agent_audit(created_at)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_skywatch_agents_name ON skywatch_agents(node_name COLLATE NOCASE, node_id)"),
+    db.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_skywatch_agents_single_vpc ON skywatch_agents(transport) WHERE transport = 'vpc'"),
+    db.prepare(`INSERT OR IGNORE INTO skywatch_agents
+      (node_id, transport, endpoint, allow_insecure_http, node_name, agent_version, key_id,
+       key_ciphertext, key_iv, connected_at, updated_at)
+      SELECT node_id, transport, endpoint, allow_insecure_http, node_name, agent_version, key_id,
+      key_ciphertext, key_iv, connected_at, updated_at
+      FROM skywatch_agent_config
+      WHERE id = 1
+        AND NOT EXISTS (SELECT 1 FROM skywatch_agent_migrations WHERE id = 1)`),
+    db.prepare("INSERT OR IGNORE INTO skywatch_agent_migrations (id) VALUES (1)"),
   ]);
 }
 
@@ -674,13 +707,18 @@ class AgentClient {
   }
 }
 
-async function getAgentConfiguration(request: Request, env: RuntimeEnv): Promise<Response> {
+async function listAgentConfigurations(request: Request, env: RuntimeEnv): Promise<Response> {
   await ensureSchema(env.DB);
   await requireAuthentication(request, env.DB);
-  return json(agentConfigurationResponse(await readAgentConfiguration(env.DB)));
+  const configurations = await readAgentConfigurations(env.DB);
+  return json({ servers: configurations.map(agentConfigurationResponse) });
 }
 
-async function updateAgentConfiguration(request: Request, env: RuntimeEnv): Promise<Response> {
+async function updateAgentConfiguration(
+  request: Request,
+  env: RuntimeEnv,
+  expectedNodeId: string | null,
+): Promise<Response> {
   await ensureSchema(env.DB);
   await requireAuthentication(request, env.DB);
   const requestId = crypto.randomUUID();
@@ -708,7 +746,7 @@ async function updateAgentConfiguration(request: Request, env: RuntimeEnv): Prom
     await writeAgentAudit(
       env.DB,
       requestId,
-      "agent.config.switch",
+      expectedNodeId ? "agent.config.update" : "agent.config.create",
       "failure",
       null,
       null,
@@ -722,7 +760,28 @@ async function updateAgentConfiguration(request: Request, env: RuntimeEnv): Prom
   try {
     const wrappingKey = requireAgentWrappingKey(env);
     const candidateTransport = createAgentTransport(env, transport);
-    const previous = await readAgentConfiguration(env.DB);
+    const previous = expectedNodeId
+      ? await requireAgentConfiguration(env.DB, expectedNodeId)
+      : null;
+    if (!previous) {
+      const count = await env.DB.prepare("SELECT COUNT(*) AS count FROM skywatch_agents")
+        .first<{ count: number }>();
+      if ((count?.count ?? 0) >= AGENT_MAX_SERVERS) {
+        throw new HttpError(409, `Skywatch supports at most ${AGENT_MAX_SERVERS} registered servers.`, "agent_limit_reached");
+      }
+    }
+    if (transport === "vpc") {
+      const occupied = await env.DB.prepare(
+        "SELECT node_id FROM skywatch_agents WHERE transport = 'vpc' AND node_id != ? LIMIT 1",
+      ).bind(expectedNodeId ?? "").first<{ node_id: string }>();
+      if (occupied) {
+        throw new HttpError(
+          409,
+          "The fixed VPS_AGENT binding is already assigned to another server. Use direct HTTPS for additional servers.",
+          "vpc_binding_in_use",
+        );
+      }
+    }
     const credentials = pairingToken
       ? parsePairingToken(pairingToken)
       : previous
@@ -746,51 +805,44 @@ async function updateAgentConfiguration(request: Request, env: RuntimeEnv): Prom
       AGENT_PAIR_TIMEOUT_MS,
     );
     const node = parseAgentNode(health.data, system.data);
-    if (previous && node.id !== previous.node_id) {
+    if (expectedNodeId && node.id !== expectedNodeId) {
       throw new HttpError(
         409,
-        "That endpoint belongs to a different node. Delete the current connection before pairing another node.",
+        "That endpoint belongs to a different node. Add it as a new server instead.",
         "node_identity_mismatch",
       );
+    }
+    if (!previous && await readAgentConfiguration(env.DB, node.id)) {
+      throw new HttpError(409, "That server is already registered in Skywatch.", "agent_already_registered");
     }
     const encrypted = await encryptAgentKey(wrappingKey, rawKey);
     const now = new Date().toISOString();
     const allowInsecureHttp = transport === "direct"
       && endpoint.startsWith("http://")
       && body.allowInsecureHttp === true;
-    await env.DB.batch([
-      env.DB.prepare(`INSERT INTO skywatch_agent_config
-        (id, transport, endpoint, allow_insecure_http, node_id, node_name, agent_version, key_id, key_ciphertext, key_iv, connected_at, updated_at)
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          transport = excluded.transport,
-          endpoint = excluded.endpoint,
-          allow_insecure_http = excluded.allow_insecure_http,
-          node_id = excluded.node_id,
-          node_name = excluded.node_name,
-          agent_version = excluded.agent_version,
-          key_id = excluded.key_id,
-          key_ciphertext = excluded.key_ciphertext,
-          key_iv = excluded.key_iv,
-          connected_at = excluded.connected_at,
-          updated_at = excluded.updated_at`)
+    const persist = previous
+      ? env.DB.prepare(`UPDATE skywatch_agents SET
+          transport = ?, endpoint = ?, allow_insecure_http = ?, node_name = ?, agent_version = ?,
+          key_id = ?, key_ciphertext = ?, key_iv = ?, updated_at = ?
+          WHERE node_id = ?`)
         .bind(
-          transport,
-          endpoint,
-          allowInsecureHttp ? 1 : 0,
-          node.id,
-          node.name,
-          node.agentVersion,
-          keyId,
-          encrypted.ciphertext,
-          encrypted.iv,
-          now,
-          now,
-        ),
+          transport, endpoint, allowInsecureHttp ? 1 : 0, node.name, node.agentVersion,
+          keyId, encrypted.ciphertext, encrypted.iv, now, node.id,
+        )
+      : env.DB.prepare(`INSERT INTO skywatch_agents
+          (node_id, transport, endpoint, allow_insecure_http, node_name, agent_version, key_id,
+           key_ciphertext, key_iv, connected_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .bind(
+          node.id, transport, endpoint, allowInsecureHttp ? 1 : 0, node.name, node.agentVersion,
+          keyId, encrypted.ciphertext, encrypted.iv, now, now,
+        );
+    await env.DB.batch([
+      persist,
       auditStatement(
         env.DB,
         requestId,
-        "agent.config.switch",
+        previous ? "agent.config.update" : "agent.config.create",
         "success",
         transport,
         node.id,
@@ -801,31 +853,34 @@ async function updateAgentConfiguration(request: Request, env: RuntimeEnv): Prom
       pruneAgentAuditStatement(env.DB),
     ]);
 
-    return json(agentConfigurationResponse(await requireAgentConfiguration(env.DB)));
+    return json(agentConfigurationResponse(await requireAgentConfiguration(env.DB, node.id)), previous ? 200 : 201);
   } catch (error) {
+    const normalizedError = !(error instanceof HttpError) && /UNIQUE constraint/i.test(String(error))
+      ? new HttpError(409, "That server or VPC binding is already registered.", "agent_already_registered")
+      : error;
     await writeAgentAudit(
       env.DB,
       requestId,
-      "agent.config.switch",
+      expectedNodeId ? "agent.config.update" : "agent.config.create",
       "failure",
       transport,
       null,
       null,
       Date.now() - startedAt,
-      agentErrorCode(error),
+      agentErrorCode(normalizedError),
     );
-    throw error;
+    throw normalizedError;
   }
 }
 
-async function deleteAgentConfiguration(request: Request, env: RuntimeEnv): Promise<Response> {
+async function deleteAgentConfiguration(request: Request, env: RuntimeEnv, nodeId: string): Promise<Response> {
   await ensureSchema(env.DB);
   await requireAuthentication(request, env.DB);
   const requestId = crypto.randomUUID();
   const startedAt = Date.now();
-  const existing = await readAgentConfiguration(env.DB);
+  const existing = await requireAgentConfiguration(env.DB, nodeId);
   await env.DB.batch([
-    env.DB.prepare("DELETE FROM skywatch_agent_config WHERE id = 1"),
+    env.DB.prepare("DELETE FROM skywatch_agents WHERE node_id = ?").bind(nodeId),
     auditStatement(
       env.DB,
       requestId,
@@ -839,18 +894,19 @@ async function deleteAgentConfiguration(request: Request, env: RuntimeEnv): Prom
     ),
     pruneAgentAuditStatement(env.DB),
   ]);
-  return json(agentConfigurationResponse(null));
+  return json({ deleted: true, id: nodeId });
 }
 
 async function proxyAgentRead(
   request: Request,
   env: RuntimeEnv,
+  nodeId: string,
   pathAndQuery: string,
   maxBytes = AGENT_MAX_RESPONSE_BYTES,
 ): Promise<Response> {
   await ensureSchema(env.DB);
   await requireAuthentication(request, env.DB);
-  const config = await requireAgentConfiguration(env.DB);
+  const config = await requireAgentConfiguration(env.DB, nodeId);
   const client = await AgentClient.fromStored(env, config);
   const response = await client.request<unknown>(pathAndQuery, "GET", undefined, AGENT_READ_TIMEOUT_MS, maxBytes);
   return json(normalizeAgentPayload(pathAndQuery, response.data, config), response.status);
@@ -859,12 +915,13 @@ async function proxyAgentRead(
 async function proxyAgentMutation(
   request: Request,
   env: RuntimeEnv,
+  nodeId: string,
   containerId: string,
   action: "start" | "stop" | "restart",
 ): Promise<Response> {
   await ensureSchema(env.DB);
   await requireAuthentication(request, env.DB);
-  const config = await requireAgentConfiguration(env.DB);
+  const config = await requireAgentConfiguration(env.DB, nodeId);
   const requestId = crypto.randomUUID();
   const startedAt = Date.now();
   try {
@@ -1387,22 +1444,55 @@ function stripIpv6Brackets(hostname: string): string {
   return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
 }
 
-function matchContainerRoute(pathname: string): { id: string; operation: "inspect" | "logs" | "start" | "stop" | "restart" } | null {
-  const match = /^\/api\/agent\/containers\/([^/]+)(?:\/(logs|start|stop|restart))?$/.exec(pathname);
-  if (!match) return null;
-  let id: string;
+type ServerRoute = {
+  serverId: string;
+  resource: "config" | "health" | "system" | "containers";
+  containerId: string | null;
+  operation: "inspect" | "logs" | "start" | "stop" | "restart" | null;
+};
+
+function matchServerRoute(pathname: string): ServerRoute | null {
+  const segments = pathname.split("/").filter(Boolean);
+  if (segments[0] !== "api" || segments[1] !== "servers" || segments.length < 3) return null;
+  let serverId: string;
   try {
-    id = decodeURIComponent(match[1]);
+    serverId = decodeURIComponent(segments[2]);
+  } catch {
+    throw new HttpError(400, "Server identifier is invalid.", "invalid_server_id");
+  }
+  if (!isCanonicalUuid(serverId)) {
+    throw new HttpError(400, "Server identifier is invalid.", "invalid_server_id");
+  }
+  if (segments.length === 3) {
+    return { serverId, resource: "config", containerId: null, operation: null };
+  }
+  if (segments.length === 4 && (segments[3] === "health" || segments[3] === "system")) {
+    return { serverId, resource: segments[3], containerId: null, operation: null };
+  }
+  if (segments[3] !== "containers" || segments.length > 6) return null;
+  if (segments.length === 4) {
+    return { serverId, resource: "containers", containerId: null, operation: null };
+  }
+  let containerId: string;
+  try {
+    containerId = decodeURIComponent(segments[4]);
   } catch {
     throw new HttpError(400, "Container identifier is invalid.", "invalid_container_id");
   }
-  if (!/^[a-f0-9]{64}$/.test(id)) {
+  if (!/^[a-f0-9]{64}$/.test(containerId)) {
     throw new HttpError(400, "Container identifier is invalid.", "invalid_container_id");
   }
-  return { id, operation: (match[2] ?? "inspect") as "inspect" | "logs" | "start" | "stop" | "restart" };
+  const operation = segments[5] ?? "inspect";
+  if (!["inspect", "logs", "start", "stop", "restart"].includes(operation)) return null;
+  return {
+    serverId,
+    resource: "containers",
+    containerId,
+    operation: operation as ServerRoute["operation"],
+  };
 }
 
-function isContainerAction(value: string): value is "start" | "stop" | "restart" {
+function isContainerAction(value: unknown): value is "start" | "stop" | "restart" {
   return value === "start" || value === "stop" || value === "restart";
 }
 
@@ -1722,34 +1812,30 @@ async function requireConfiguration(db: D1Database): Promise<StoredConfiguration
   return config;
 }
 
-async function readAgentConfiguration(db: D1Database): Promise<StoredAgentConfiguration | null> {
-  return db.prepare(`SELECT transport, endpoint, allow_insecure_http, node_id, node_name, agent_version, key_id,
+async function readAgentConfigurations(db: D1Database): Promise<StoredAgentConfiguration[]> {
+  const result = await db.prepare(`SELECT transport, endpoint, allow_insecure_http, node_id, node_name, agent_version, key_id,
     key_ciphertext, key_iv, connected_at, updated_at
-    FROM skywatch_agent_config WHERE id = 1`).first<StoredAgentConfiguration>();
+    FROM skywatch_agents ORDER BY node_name COLLATE NOCASE, node_id`).all<StoredAgentConfiguration>();
+  return result.results;
 }
 
-async function requireAgentConfiguration(db: D1Database): Promise<StoredAgentConfiguration> {
-  const configuration = await readAgentConfiguration(db);
+async function readAgentConfiguration(db: D1Database, nodeId: string): Promise<StoredAgentConfiguration | null> {
+  return db.prepare(`SELECT transport, endpoint, allow_insecure_http, node_id, node_name, agent_version, key_id,
+    key_ciphertext, key_iv, connected_at, updated_at
+    FROM skywatch_agents WHERE node_id = ? LIMIT 1`).bind(nodeId).first<StoredAgentConfiguration>();
+}
+
+async function requireAgentConfiguration(db: D1Database, nodeId: string): Promise<StoredAgentConfiguration> {
+  const configuration = await readAgentConfiguration(db, nodeId);
   if (!configuration) {
-    throw new HttpError(409, "Connect a VPS agent first.", "agent_not_configured");
+    throw new HttpError(404, "That registered server was not found.", "agent_not_configured");
   }
   return configuration;
 }
 
-function agentConfigurationResponse(configuration: StoredAgentConfiguration | null): AgentConfigResponse {
-  if (!configuration) {
-    return {
-      configured: false,
-      transport: null,
-      endpoint: null,
-      allowInsecureHttp: false,
-      node: null,
-      connectedAt: null,
-      updatedAt: null,
-    };
-  }
+function agentConfigurationResponse(configuration: StoredAgentConfiguration): AgentConfigResponse {
   return {
-    configured: true,
+    id: configuration.node_id,
     transport: configuration.transport,
     endpoint: configuration.endpoint,
     allowInsecureHttp: configuration.allow_insecure_http === 1,
@@ -2087,6 +2173,7 @@ export const __test = {
   parseAgentNode,
   normalizeAgentPayload,
   agentConfigurationResponse,
+  matchServerRoute,
   agentRequestCanonical,
   agentResponseCanonical,
   selectAgentTransport(transport: AgentTransportName, binding?: Fetcher): AgentTransportName {

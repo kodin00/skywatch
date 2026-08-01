@@ -18,6 +18,7 @@ import {
   Menu,
   MoreHorizontal,
   Play,
+  Plus,
   RefreshCw,
   RotateCw,
   Search,
@@ -72,14 +73,15 @@ type ApiError = { error?: string; code?: string }
 type AgentTransport = 'vpc' | 'direct'
 type AgentNode = { id: string; name: string; agentVersion?: string }
 type AgentConfig = {
-  configured: boolean
-  transport: AgentTransport | null
-  endpoint: string | null
+  id: string
+  transport: AgentTransport
+  endpoint: string
   allowInsecureHttp: boolean
-  node: AgentNode | null
-  connectedAt: string | null
-  updatedAt: string | null
+  node: AgentNode
+  connectedAt: string
+  updatedAt: string
 }
+type AgentConfigsResponse = { servers: AgentConfig[] }
 type AgentHealth = {
   status: 'ok' | 'degraded'
   node: { id: string; name: string }
@@ -409,7 +411,7 @@ function ConfirmAgentActionDialog({ container, action, busy, error, onClose, onC
   </div>
 }
 
-function ContainerLogsDialog({ container, onClose }: { container: AgentContainer; onClose: () => void }) {
+function ContainerLogsDialog({ serverId, container, onClose }: { serverId: string; container: AgentContainer; onClose: () => void }) {
   const [tail, setTail] = useState(200)
   const [logs, setLogs] = useState('')
   const [truncated, setTruncated] = useState(false)
@@ -422,7 +424,7 @@ function ContainerLogsDialog({ container, onClose }: { container: AgentContainer
     setError('')
     try {
       const result = await api<{ containerId: string; logs: string; truncated: boolean; collectedAt: string }>(
-        `/api/agent/containers/${encodeURIComponent(container.id)}/logs?tail=${tail}`,
+        `/api/servers/${encodeURIComponent(serverId)}/containers/${encodeURIComponent(container.id)}/logs?tail=${tail}`,
       )
       setLogs(result.logs)
       setTruncated(result.truncated)
@@ -432,7 +434,7 @@ function ContainerLogsDialog({ container, onClose }: { container: AgentContainer
     } finally {
       setLoading(false)
     }
-  }, [container.id, tail])
+  }, [container.id, serverId, tail])
 
   useEffect(() => { void loadLogs() }, [loadLogs])
 
@@ -450,16 +452,85 @@ function ContainerLogsDialog({ container, onClose }: { container: AgentContainer
   </div>
 }
 
-function ServersDashboard() {
-  const [config, setConfig] = useState<AgentConfig | null>(null)
-  const [transport, setTransport] = useState<AgentTransport>('vpc')
-  const [endpoint, setEndpoint] = useState('http://skywatch-agent.internal')
+function sortServers(servers: AgentConfig[]): AgentConfig[] {
+  return [...servers].sort((left, right) => {
+    const names = left.node.name.toLowerCase().localeCompare(right.node.name.toLowerCase())
+    return names || left.id.localeCompare(right.id)
+  })
+}
+
+function AgentConfigPanel({ config, vpcInUse, loading, onSaved, onCancel }: {
+  config: AgentConfig | null
+  vpcInUse: boolean
+  loading: boolean
+  onSaved: (config: AgentConfig) => void
+  onCancel: (() => void) | null
+}) {
+  const [transport, setTransport] = useState<AgentTransport>(config?.transport ?? 'direct')
+  const [endpoint, setEndpoint] = useState(config?.endpoint ?? 'https://agent.example.com')
   const [pairingToken, setPairingToken] = useState('')
-  const [allowInsecureHttp, setAllowInsecureHttp] = useState(false)
-  const [showConfig, setShowConfig] = useState(true)
-  const [configLoading, setConfigLoading] = useState(true)
-  const [configSaving, setConfigSaving] = useState(false)
-  const [configError, setConfigError] = useState('')
+  const [allowInsecureHttp, setAllowInsecureHttp] = useState(config?.allowInsecureHttp ?? false)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const vpcUnavailable = vpcInUse && config?.transport !== 'vpc'
+
+  const selectTransport = (next: AgentTransport) => {
+    if (next === 'vpc' && vpcUnavailable) return
+    setTransport(next)
+    setAllowInsecureHttp(false)
+    if (next === 'vpc' && (!endpoint || endpoint === 'https://agent.example.com')) setEndpoint('http://skywatch-agent.internal')
+    if (next === 'direct' && (!endpoint || endpoint === 'http://skywatch-agent.internal')) setEndpoint('https://agent.example.com')
+  }
+
+  const insecureHttp = transport === 'direct' && isInsecureHttpEndpoint(endpoint)
+  const canSave = endpoint.trim().length > 0
+    && (Boolean(config) || pairingToken.trim().length > 0)
+    && (!insecureHttp || allowInsecureHttp)
+
+  const save = async () => {
+    setSaving(true)
+    setError('')
+    try {
+      const path = config ? `/api/servers/${encodeURIComponent(config.id)}` : '/api/servers'
+      const result = await api<AgentConfig>(path, {
+        method: config ? 'PUT' : 'POST',
+        body: JSON.stringify({
+          transport,
+          endpoint: endpoint.trim(),
+          pairingToken: pairingToken.trim(),
+          ...(insecureHttp ? { allowInsecureHttp } : {}),
+        }),
+      })
+      onSaved(result)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'The server connection could not be saved.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return <section className="agent-config-panel" aria-busy={loading || saving}>
+    <header><div><span className="eyebrow"><span /> Connection settings</span><h2>{config ? `Update ${config.node.name}` : 'Register another server'}</h2><p>Pair the node once, then Skywatch keeps its transport and encrypted signing key separate.</p></div>{onCancel && <button className="icon-button" type="button" onClick={onCancel} aria-label="Close connection settings"><X size={17} /></button>}</header>
+    {error && <div className="dashboard-error" role="alert"><span>{error}</span></div>}
+    <div className="transport-switch" role="radiogroup" aria-label="Agent transport">
+      <button type="button" role="radio" aria-checked={transport === 'vpc'} disabled={vpcUnavailable} className={transport === 'vpc' ? 'active' : ''} onClick={() => selectTransport('vpc')}><Cloud size={18} /><span><strong>Cloudflare VPC</strong><small>{vpcUnavailable ? 'Static binding already assigned' : 'Private, fixed-scope binding'}</small></span><em>One slot</em></button>
+      <button type="button" role="radio" aria-checked={transport === 'direct'} className={transport === 'direct' ? 'active' : ''} onClick={() => selectTransport('direct')}><Globe2 size={18} /><span><strong>Direct endpoint</strong><small>HTTPS Tunnel or public origin</small></span></button>
+    </div>
+    <div className="agent-fields">
+      <label><span>{transport === 'vpc' ? 'Tunnel request URL' : 'Public agent URL'}</span><input type="url" spellCheck="false" value={endpoint} onChange={(event) => { setEndpoint(event.target.value); setAllowInsecureHttp(false) }} placeholder={transport === 'vpc' ? 'http://skywatch-agent.internal' : 'https://agent.example.com'} /><small>{transport === 'vpc' ? 'The single VPS_AGENT binding fixes the destination. Additional servers should use direct HTTPS.' : 'Use a Cloudflare Tunnel hostname or another public HTTPS origin. Redirects are rejected.'}</small></label>
+      <label><span>Agent pairing key</span><input type="password" autoComplete="new-password" spellCheck="false" value={pairingToken} onChange={(event) => setPairingToken(event.target.value)} placeholder={config ? 'Leave blank to keep the encrypted key' : 'key-id.base64url-secret'} /><small>{config ? 'Leave blank to reuse this server’s encrypted key.' : 'Run skywatch pairing-key on this VPS. The secret is never returned by Skywatch.'}</small></label>
+    </div>
+    {insecureHttp && <div className="insecure-warning" role="alert"><AlertTriangle size={18} /><div><strong>HTTP exposes control traffic on the public internet.</strong><p>Only literal public IP addresses can use this escape hatch. Metrics, logs, and action metadata are not encrypted.</p><label><input type="checkbox" checked={allowInsecureHttp} onChange={(event) => setAllowInsecureHttp(event.target.checked)} /> I understand the risk and want to allow insecure HTTP.</label></div></div>}
+    <footer><span>{loading ? 'Loading registered servers…' : 'Skywatch verifies the signed node identity before saving.'}</span><button className="dialog-save" type="button" disabled={loading || saving || !canSave} onClick={() => void save()}>{saving ? 'Testing connection…' : config ? 'Test and update' : 'Test and register'}</button></footer>
+  </section>
+}
+
+function ServerWorkspace({ config, deleting, onEdit, onDelete }: {
+  config: AgentConfig
+  deleting: boolean
+  onEdit: () => void
+  onDelete: () => void
+}) {
   const [health, setHealth] = useState<AgentHealth | null>(null)
   const [system, setSystem] = useState<AgentSystem | null>(null)
   const [containers, setContainers] = useState<AgentContainer[]>([])
@@ -472,39 +543,24 @@ function ServersDashboard() {
   const [actionError, setActionError] = useState('')
   const [logsContainer, setLogsContainer] = useState<AgentContainer | null>(null)
   const pollInFlight = useRef(false)
+  const mounted = useRef(true)
 
   useEffect(() => {
-    let cancelled = false
-    const loadConfig = async () => {
-      setConfigLoading(true)
-      setConfigError('')
-      try {
-        const result = await api<AgentConfig>('/api/agent/config')
-        if (cancelled) return
-        setConfig(result)
-        setShowConfig(!result.configured)
-        if (result.transport) setTransport(result.transport)
-        if (result.endpoint) setEndpoint(result.endpoint)
-        setAllowInsecureHttp(result.allowInsecureHttp)
-      } catch (caught) {
-        if (!cancelled) setConfigError(caught instanceof Error ? caught.message : 'Agent configuration could not be loaded.')
-      } finally {
-        if (!cancelled) setConfigLoading(false)
-      }
-    }
-    void loadConfig()
-    return () => { cancelled = true }
+    mounted.current = true
+    return () => { mounted.current = false }
   }, [])
 
   const fetchLive = useCallback(async (): Promise<boolean> => {
     if (pollInFlight.current) return false
     pollInFlight.current = true
     setPolling(true)
+    const base = `/api/servers/${encodeURIComponent(config.id)}`
     const [healthResult, systemResult, containersResult] = await Promise.allSettled([
-      api<AgentHealth>('/api/agent/health'),
-      api<AgentSystem>('/api/agent/system'),
-      api<ContainersResponse>('/api/agent/containers'),
+      api<AgentHealth>(`${base}/health`),
+      api<AgentSystem>(`${base}/system`),
+      api<ContainersResponse>(`${base}/containers`),
     ])
+    if (!mounted.current) return false
     let firstError = ''
     if (healthResult.status === 'fulfilled') setHealth(healthResult.value)
     else firstError ||= healthResult.reason instanceof Error ? healthResult.reason.message : 'Agent health is unavailable.'
@@ -524,10 +580,9 @@ function ServersDashboard() {
     pollInFlight.current = false
     setPolling(false)
     return successful
-  }, [])
+  }, [config.id])
 
   useEffect(() => {
-    if (!config?.configured) return
     let stopped = false
     let timer: number | undefined
     let failures = 0
@@ -552,54 +607,7 @@ function ServersDashboard() {
       window.clearTimeout(timer)
       document.removeEventListener('visibilitychange', visibilityChanged)
     }
-  }, [config?.configured, fetchLive])
-
-  const selectTransport = (next: AgentTransport) => {
-    setTransport(next)
-    setAllowInsecureHttp(false)
-    if (next === 'vpc' && (!endpoint || endpoint === 'https://agent.example.com')) setEndpoint('http://skywatch-agent.internal')
-    if (next === 'direct' && (!endpoint || endpoint === 'http://skywatch-agent.internal')) setEndpoint('https://agent.example.com')
-  }
-
-  const saveConfig = async () => {
-    setConfigSaving(true)
-    setConfigError('')
-    try {
-      const result = await api<AgentConfig>('/api/agent/config', {
-        method: 'PUT',
-        body: JSON.stringify({ transport, endpoint: endpoint.trim(), pairingToken: pairingToken.trim(), ...(isInsecureHttpEndpoint(endpoint) ? { allowInsecureHttp } : {}) }),
-      })
-      setConfig(result)
-      setAllowInsecureHttp(result.allowInsecureHttp)
-      setPairingToken('')
-      setShowConfig(false)
-      setPollError('')
-    } catch (caught) {
-      setConfigError(caught instanceof Error ? caught.message : 'The agent connection could not be saved.')
-    } finally {
-      setConfigSaving(false)
-    }
-  }
-
-  const deleteConfig = async () => {
-    if (!window.confirm('Disconnect this server from Skywatch? The agent keeps running, and Skywatch will remove its stored pairing credentials.')) return
-    setConfigSaving(true)
-    setConfigError('')
-    try {
-      const result = await api<AgentConfig>('/api/agent/config', { method: 'DELETE' })
-      setConfig(result)
-      setHealth(null)
-      setSystem(null)
-      setContainers([])
-      setContainersAt(null)
-      setLastSuccessAt(null)
-      setShowConfig(true)
-    } catch (caught) {
-      setConfigError(caught instanceof Error ? caught.message : 'The agent connection could not be deleted.')
-    } finally {
-      setConfigSaving(false)
-    }
-  }
+  }, [fetchLive])
 
   const runAction = async () => {
     if (!pendingAction || actionBusy) return
@@ -607,7 +615,7 @@ function ServersDashboard() {
     setActionError('')
     try {
       const result = await api<{ action: AgentAction; container: AgentContainer; completedAt: string }>(
-        `/api/agent/containers/${encodeURIComponent(pendingAction.container.id)}/${pendingAction.action}`,
+        `/api/servers/${encodeURIComponent(config.id)}/containers/${encodeURIComponent(pendingAction.container.id)}/${pendingAction.action}`,
         { method: 'POST', body: '{}' },
       )
       setContainers((current) => current.map((container) => container.id === result.container.id ? result.container : container))
@@ -620,42 +628,21 @@ function ServersDashboard() {
     }
   }
 
-  const insecureHttp = transport === 'direct' && isInsecureHttpEndpoint(endpoint)
-  const canSave = endpoint.trim().length > 0 && (config?.configured || pairingToken.trim().length > 0) && (!insecureHttp || allowInsecureHttp)
   const storage = system?.storage.find((disk) => disk.mount === '/') ?? system?.storage[0]
   const runningCount = containers.filter((container) => container.state.toLowerCase() === 'running').length
   const stale = Boolean(pollError && lastSuccessAt)
   const healthDegraded = health?.status === 'degraded' || health?.dockerAvailable === false
 
-  return <div className="content servers-content">
-    <div className="page-heading servers-heading">
-      <div><span className="eyebrow"><span /> Host control plane</span><h1>Servers</h1><p>Live host metrics and bounded Docker controls through the Skywatch agent.</p></div>
-      {config?.configured && <div className={`agent-state ${pollError || healthDegraded ? 'degraded' : 'online'}`}>{pollError || healthDegraded ? <WifiOff size={14} /> : <Wifi size={14} />}<span><strong>{pollError ? stale ? 'Stale data' : 'Agent unavailable' : healthDegraded ? 'Docker degraded' : 'Agent connected'}</strong>{lastSuccessAt ? `Updated ${relativeDate(lastSuccessAt)}` : 'Waiting for first sample'}</span></div>}
+  return <>
+    <div className="selected-server-status">
+      <div><span className="eyebrow"><span /> Selected node</span><strong>{config.node.name}</strong></div>
+      <div className={`agent-state ${pollError || healthDegraded ? 'degraded' : 'online'}`}>{pollError || healthDegraded ? <WifiOff size={14} /> : <Wifi size={14} />}<span><strong>{pollError ? stale ? 'Stale data' : 'Agent unavailable' : healthDegraded ? 'Docker degraded' : 'Agent connected'}</strong>{lastSuccessAt ? `Updated ${relativeDate(lastSuccessAt)}` : 'Waiting for first sample'}</span></div>
     </div>
-
-    {configError && <div className="dashboard-error" role="alert"><span>{configError}</span></div>}
-
-    {config?.configured && !showConfig && <section className="agent-connection-card">
-      <div className="connection-identity"><span className="server-mark"><Server size={21} /></span><div><span className="eyebrow"><span /> Paired node</span><h2>{config.node?.name ?? 'Skywatch agent'}</h2><p>{config.node?.id ?? 'Node identity pending'}</p></div></div>
+    <section className="agent-connection-card">
+      <div className="connection-identity"><span className="server-mark"><Server size={21} /></span><div><span className="eyebrow"><span /> Paired node</span><h2>{config.node.name}</h2><p>{config.node.id}</p></div></div>
       <dl><div><dt>Transport</dt><dd><span className={`transport-tag ${config.transport} ${config.transport === 'direct' && isInsecureHttpEndpoint(config.endpoint ?? '') ? 'unsafe' : ''}`}>{config.transport === 'vpc' ? 'VPC tunnel' : isInsecureHttpEndpoint(config.endpoint ?? '') ? 'Direct HTTP · Unsafe' : 'Direct HTTPS'}</span></dd></div><div><dt>Endpoint</dt><dd>{config.endpoint}</dd></div><div><dt>Agent</dt><dd>{config.node?.agentVersion ?? health?.agentVersion ?? 'Checking…'}</dd></div></dl>
-      <div className="connection-actions"><button type="button" className="secondary-button" onClick={() => setShowConfig(true)}><Settings size={15} /> Edit</button><button type="button" className="icon-button danger-icon" disabled={configSaving} onClick={() => void deleteConfig()} aria-label="Delete agent connection"><Trash2 size={16} /></button></div>
-    </section>}
-
-    {(!config?.configured || showConfig) && <section className="agent-config-panel" aria-busy={configLoading || configSaving}>
-      <header><div><span className="eyebrow"><span /> Connection settings</span><h2>{config?.configured ? 'Update the agent route' : 'Connect your first server'}</h2><p>The same authenticated agent protocol works over a private VPC Service or a public endpoint.</p></div>{config?.configured && <button className="icon-button" type="button" onClick={() => setShowConfig(false)} aria-label="Close connection settings"><X size={17} /></button>}</header>
-      <div className="transport-switch" role="radiogroup" aria-label="Agent transport">
-        <button type="button" role="radio" aria-checked={transport === 'vpc'} className={transport === 'vpc' ? 'active' : ''} onClick={() => selectTransport('vpc')}><Cloud size={18} /><span><strong>Cloudflare VPC</strong><small>Private, outbound-only tunnel</small></span><em>Recommended</em></button>
-        <button type="button" role="radio" aria-checked={transport === 'direct'} className={transport === 'direct' ? 'active' : ''} onClick={() => selectTransport('direct')}><Globe2 size={18} /><span><strong>Direct endpoint</strong><small>Public HTTPS to the VPS</small></span></button>
-      </div>
-      <div className="agent-fields">
-        <label><span>{transport === 'vpc' ? 'Tunnel request URL' : 'Public agent URL'}</span><input type="url" spellCheck="false" value={endpoint} onChange={(event) => { setEndpoint(event.target.value); setAllowInsecureHttp(false) }} placeholder={transport === 'vpc' ? 'http://skywatch-agent.internal' : 'https://agent.example.com'} /><small>{transport === 'vpc' ? 'The VPC Service binding fixes the real destination; this URL supplies the agent Host header and HTTPS SNI.' : 'Use HTTPS with a certificate valid for this hostname or literal IP. Redirects are rejected.'}</small></label>
-        <label><span>Agent pairing key</span><input type="password" autoComplete="new-password" spellCheck="false" value={pairingToken} onChange={(event) => setPairingToken(event.target.value)} placeholder={config?.configured ? 'Leave blank to keep the encrypted key' : 'key-id.base64url-secret'} /><small>{config?.configured ? 'Leave blank to reuse the encrypted key. A replacement is stored encrypted and never returned.' : 'Used to test signed health, then stored encrypted. It is never returned by Skywatch.'}</small></label>
-      </div>
-      {insecureHttp && <div className="insecure-warning" role="alert"><AlertTriangle size={18} /><div><strong>HTTP exposes control traffic on the public internet.</strong><p>Only literal public IP addresses can use this escape hatch. Metrics, logs, and action metadata are not encrypted; HMAC authenticates and integrity-protects them, but does not provide confidentiality.</p><label><input type="checkbox" checked={allowInsecureHttp} onChange={(event) => setAllowInsecureHttp(event.target.checked)} /> I understand the risk and want to allow insecure HTTP.</label></div></div>}
-      <footer><span>{configLoading ? 'Loading current connection…' : 'The candidate is health-checked before Skywatch switches routes.'}</span><button className="dialog-save" type="button" disabled={configLoading || configSaving || !canSave} onClick={() => void saveConfig()}>{configSaving ? 'Testing connection…' : config?.configured ? 'Test and update' : 'Test and connect'}</button></footer>
-    </section>}
-
-    {config?.configured && <>
+      <div className="connection-actions"><button type="button" className="secondary-button" onClick={onEdit}><Settings size={15} /> Edit</button><button type="button" className="icon-button danger-icon" disabled={deleting} onClick={onDelete} aria-label={`Delete ${config.node.name}`}><Trash2 size={16} /></button></div>
+    </section>
       {pollError && <div className="dashboard-error stale-error" role="alert"><span>{pollError}{lastSuccessAt ? ` Showing the last successful sample from ${relativeDate(lastSuccessAt)}.` : ''}</span><button type="button" disabled={polling} onClick={() => void fetchLive()}>Retry now</button></div>}
       <div className="server-toolbar"><div><span className="result-count">Auto-refreshes every 5 seconds while this tab is visible</span>{polling && <RefreshCw className="spin" size={13} />}</div><button className="secondary-button" type="button" disabled={polling} onClick={() => void fetchLive()}><RefreshCw size={15} className={polling ? 'spin' : ''} /> Refresh now</button></div>
 
@@ -686,10 +673,89 @@ function ServersDashboard() {
           })}
         </div>
       </section>
-    </>}
-
     {pendingAction && <ConfirmAgentActionDialog container={pendingAction.container} action={pendingAction.action} busy={actionBusy} error={actionError} onClose={() => { if (!actionBusy) setPendingAction(null) }} onConfirm={() => void runAction()} />}
-    {logsContainer && <ContainerLogsDialog container={logsContainer} onClose={() => setLogsContainer(null)} />}
+    {logsContainer && <ContainerLogsDialog serverId={config.id} container={logsContainer} onClose={() => setLogsContainer(null)} />}
+  </>
+}
+
+function ServersDashboard() {
+  const [servers, setServers] = useState<AgentConfig[]>([])
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [formMode, setFormMode] = useState<'add' | 'edit' | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [deleting, setDeleting] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      setLoading(true)
+      setError('')
+      try {
+        const result = await api<AgentConfigsResponse>('/api/servers')
+        if (cancelled) return
+        const next = sortServers(result.servers)
+        setServers(next)
+        setSelectedId((current) => current && next.some((server) => server.id === current) ? current : next[0]?.id ?? null)
+        setFormMode(next.length ? null : 'add')
+      } catch (caught) {
+        if (!cancelled) setError(caught instanceof Error ? caught.message : 'Registered servers could not be loaded.')
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    void load()
+    return () => { cancelled = true }
+  }, [])
+
+  const selected = servers.find((server) => server.id === selectedId) ?? null
+  const formConfig = formMode === 'edit' ? selected : null
+  const vpcInUse = servers.some((server) => server.transport === 'vpc')
+
+  const saved = (server: AgentConfig) => {
+    setServers((current) => sortServers([...current.filter((item) => item.id !== server.id), server]))
+    setSelectedId(server.id)
+    setFormMode(null)
+    setError('')
+  }
+
+  const deleteSelected = async () => {
+    if (!selected || deleting) return
+    if (!window.confirm(`Disconnect ${selected.node.name} from Skywatch? The agent keeps running, but its stored pairing credentials will be removed.`)) return
+    setDeleting(true)
+    setError('')
+    try {
+      await api(`/api/servers/${encodeURIComponent(selected.id)}`, { method: 'DELETE' })
+      const remaining = servers.filter((server) => server.id !== selected.id)
+      setServers(remaining)
+      setSelectedId(remaining[0]?.id ?? null)
+      setFormMode(remaining.length ? null : 'add')
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'The server connection could not be deleted.')
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  return <div className="content servers-content">
+    <div className="page-heading servers-heading">
+      <div><span className="eyebrow"><span /> Host control plane</span><h1>Servers</h1><p>Switch between registered nodes without mixing their metrics, logs, or controls.</p></div>
+      <button className="secondary-button add-server-button" type="button" onClick={() => setFormMode('add')}><Plus size={16} /> Add server</button>
+    </div>
+
+    <section className="server-fleet" aria-label="Registered servers">
+      <header><span>Registered nodes</span><strong>{servers.length}</strong><small>Only the selected node is polled</small></header>
+      <div className="server-rack">
+        {servers.map((server) => <button key={server.id} type="button" className={server.id === selectedId ? 'active' : ''} aria-pressed={server.id === selectedId} onClick={() => { setSelectedId(server.id); setFormMode(null) }}><i /><span><strong>{server.node.name}</strong><small>{server.transport === 'vpc' ? 'VPC binding' : isInsecureHttpEndpoint(server.endpoint) ? 'Direct HTTP' : 'Direct HTTPS'}</small></span><em>{server.node.agentVersion ?? 'agent'}</em></button>)}
+        {!servers.length && !loading && <div className="server-rack-empty"><Server size={18} /><span><strong>No registered nodes</strong><small>Pair the first VPS to begin.</small></span></div>}
+      </div>
+    </section>
+
+    {error && <div className="dashboard-error" role="alert"><span>{error}</span></div>}
+    {loading && !servers.length && <div className="empty-state"><RefreshCw className="spin" size={22} /><h2>Loading server registry</h2><p>Reading encrypted agent connections from D1.</p></div>}
+
+    {formMode && <AgentConfigPanel key={formMode === 'edit' && formConfig ? formConfig.id : 'new-server'} config={formConfig} vpcInUse={vpcInUse} loading={loading} onSaved={saved} onCancel={servers.length ? () => setFormMode(null) : null} />}
+    {!formMode && selected && <ServerWorkspace key={selected.id} config={selected} deleting={deleting} onEdit={() => setFormMode('edit')} onDelete={() => void deleteSelected()} />}
   </div>
 }
 

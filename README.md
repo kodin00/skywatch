@@ -67,7 +67,7 @@ Run `mise run agent:dev` in a second terminal after generating a development age
 
 ## VPS agent
 
-The optional Rust agent in [`agent/`](./agent/) adds live host metrics and bounded Docker controls to the Servers view. The browser never talks to the agent directly: Skywatch's Worker signs every request and selects one configured transport without automatic fallback.
+The optional Rust agent in [`agent/`](./agent/) adds live host metrics and bounded Docker controls to the Servers view. Register multiple VPS nodes and switch between them from the server rack; only the selected node is polled. The browser never talks to an agent directly: Skywatch's Worker signs every request and uses that server's configured transport without automatic fallback.
 
 On a Linux VPS with Docker and systemd, install and start it with:
 
@@ -84,6 +84,10 @@ safety-checked command list, including uninstall and permanent deletion.
 - **Workers VPC Service:** private Worker-to-agent routing through `cloudflared`. The agent can remain on `127.0.0.1:8788`.
 - **Public Cloudflare Tunnel URL:** normal HTTPS `fetch()` through a public tunnel hostname to the same loopback listener.
 - **Public VPS IP over HTTP:** an explicit unsafe escape hatch. It requires opt-in on both the agent and dashboard and does not encrypt metrics, logs, or action metadata.
+
+Direct HTTPS supports multiple independently paired servers. The committed `VPS_AGENT` binding is
+fixed to one VPC Service, so one registered server can use VPC in this version; use distinct public
+Cloudflare Tunnel hostnames for additional private-origin agents.
 
 Follow [`agent/README.md`](./agent/README.md) for agent initialization, systemd installation, and transport-specific setup. The signing key is shown only during initialization; paste it into the Servers connection form, where Skywatch encrypts it using the same Worker-only key separation used for the Cloudflare token.
 
