@@ -17,10 +17,10 @@ The installer prints the pairing key needed by the Servers view. See [`agent/REA
 ## What gets deployed
 
 - One TypeScript Cloudflare Worker serving the React dashboard and same-origin API routes.
-- One automatically provisioned D1 database for encrypted configuration and browser sessions.
+- One automatically provisioned D1 database for encrypted configuration.
 - One AES-256-GCM `secret_key` binding created during first-run setup. Cloudflare does not expose the key after it is stored.
 
-D1 is provisioned and bound by Wrangler during deployment. After the API token is submitted, Skywatch initializes its tables, generates the Worker-only encryption key, encrypts the token, stores only ciphertext and its IV in D1, and creates an HttpOnly browser session.
+D1 is provisioned and bound by Wrangler during deployment. After the API token is submitted, Skywatch initializes its tables, generates the Worker-only encryption key, encrypts the token, and stores only ciphertext and its IV in D1.
 
 ## Required API token permissions
 
@@ -51,7 +51,7 @@ After deployment, open the Worker URL and paste the scoped API token. The token 
 
 ### First-run security
 
-The first successful setup claims the installation, issues a session to that browser, reads the token owner's email, and creates a Cloudflare Access application for the Skywatch Worker with an Allow policy for exactly that email. Open the deployment immediately after creating it because this protection is installed only after the setup token has been validated.
+The first successful setup claims the installation, reads the token owner's email, and creates a Cloudflare Access application for the Skywatch Worker with an Allow policy for exactly that email. After setup, Cloudflare Access is the dashboard's authentication boundary, so returning through Access does not require pasting the API token again. Open the deployment immediately after creating it because this protection is installed only after the setup token has been validated.
 
 ## Local development
 
@@ -129,7 +129,7 @@ mise run check       # Verify the Worker, dashboard, and Rust agent
 
 - API tokens are encrypted with AES-256-GCM and authenticated additional data before being written to D1.
 - The wrapping key is held as a Cloudflare Worker `secret_key` binding, separate from D1.
-- Browser sessions are random, hashed in D1, HttpOnly, Secure, SameSite=Strict, and expire after 30 days.
+- Cloudflare Access is the authentication boundary after first-run setup and permits only the token owner's email by default.
 - API mutations enforce same-origin requests.
 - A D1-only leak does not reveal the API token. An actor with Workers Scripts Edit can still replace Worker code, so keep account membership and API-token access tightly controlled.
 

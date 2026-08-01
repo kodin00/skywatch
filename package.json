@@ -33,7 +33,7 @@
   "cloudflare": {
     "bindings": {
       "DB": {
-        "description": "Skywatch automatically provisions this D1 database for encrypted configuration and browser sessions."
+        "description": "Skywatch automatically provisions this D1 database for encrypted configuration."
       },
       "SKYWATCH_WORKER_NAME": {
         "description": "Keep this equal to the deployed Worker name so Skywatch can install its encryption key during setup."

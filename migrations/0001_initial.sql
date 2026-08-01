@@ -8,12 +8,6 @@ CREATE TABLE IF NOT EXISTS skywatch_config (
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS skywatch_sessions (
-  token_hash TEXT PRIMARY KEY,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  expires_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS skywatch_setup_lock (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   nonce TEXT NOT NULL,

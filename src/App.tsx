@@ -36,11 +36,10 @@ import {
 
 type SetupState = 'token' | 'working' | 'complete'
 type AccessType = 'protected' | 'public'
-type AppMode = 'loading' | 'setup' | 'unlock' | 'dashboard'
+type AppMode = 'loading' | 'setup' | 'dashboard'
 
 type StatusResponse = {
   configured: boolean
-  authenticated: boolean
   account: { id: string; name: string } | null
   database: 'connected'
   encryption: 'pending' | 'finalizing' | 'ready' | 'mismatch'
@@ -140,7 +139,7 @@ function Logo() {
   )
 }
 
-function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnected: (status: StatusResponse) => void }) {
+function SetupScreen({ onConnected }: { onConnected: (status: StatusResponse) => void }) {
   const [token, setToken] = useState('')
   const [state, setState] = useState<SetupState>('token')
   const [task, setTask] = useState(-1)
@@ -149,8 +148,6 @@ function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnec
   const [protectedEmail, setProtectedEmail] = useState('')
   const [finalizing, setFinalizing] = useState(false)
   const autoFinalizeStarted = useRef(false)
-  const isUnlock = mode === 'unlock'
-
   useEffect(() => {
     if (state !== 'working') return
     const timer = window.setInterval(() => {
@@ -164,14 +161,8 @@ function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnec
     if (cleanToken.length < 20) return
     setError('')
     setState('working')
-    setTask(isUnlock ? 2 : 0)
+    setTask(0)
     try {
-      if (isUnlock) {
-        await api('/api/unlock', { method: 'POST', body: JSON.stringify({ token: cleanToken }) })
-        const status = await api<StatusResponse>('/api/status')
-        onConnected(status)
-        return
-      }
       const result = await api<{
         account: { id: string; name: string }
         protection: { email: string; pending: boolean }
@@ -235,11 +226,11 @@ function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnec
           {state === 'token' && (
             <div className="token-view">
               <div className="permission-heading">
-                <h1>{isUnlock ? 'Unlock Skywatch' : 'Required token permissions'}</h1>
-                <p>{isUnlock ? 'Paste the API token used to set up this instance.' : 'Create a scoped token with exactly these permissions.'}</p>
+                <h1>Required token permissions</h1>
+                <p>Create a scoped token with exactly these permissions.</p>
               </div>
 
-              {!isUnlock && <>
+              <>
                 <div className="permission-list">
                   <div className="permission-row"><span>Account</span><strong>Workers Scripts</strong><em>Read + Edit</em></div>
                   <div className="permission-row"><span>Account</span><strong>Access: Apps and Policies</strong><em>Edit</em></div>
@@ -249,7 +240,7 @@ function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnec
                   <div className="permission-row"><span>Resources</span><strong>Include</strong><em>One account</em></div>
                 </div>
                 <a className="create-token-button" href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noreferrer">Create token</a>
-              </>}
+              </>
 
               <form onSubmit={(event) => { event.preventDefault(); void connect() }}>
                 <label className="sr-only" htmlFor="api-token">Cloudflare API token</label>
@@ -280,7 +271,7 @@ function SetupScreen({ mode, onConnected }: { mode: 'setup' | 'unlock'; onConnec
           {state === 'working' && (
             <div className="progress-view" aria-live="polite">
               <div className="orbit-mark"><Cloud size={25} /><span /></div>
-              <h2>{isUnlock ? 'Unlocking Skywatch' : 'Setting up Skywatch'}</h2>
+              <h2>Setting up Skywatch</h2>
               <p>Secure handshakes are in progress. Keep this tab open.</p>
               <div className="task-list">
                 {setupTasks.map((item, index) => {
@@ -889,7 +880,7 @@ export default function App() {
     try {
       const next = await api<StatusResponse>('/api/status')
       setStatus(next)
-      setMode(!next.configured ? 'setup' : next.authenticated ? 'dashboard' : 'unlock')
+      setMode(next.configured ? 'dashboard' : 'setup')
     } catch (caught) {
       setBootError(caught instanceof Error ? caught.message : 'Skywatch could not start.')
     }
@@ -899,7 +890,7 @@ export default function App() {
 
   if (bootError) return <main className="boot-state"><Logo /><h1>Skywatch could not start</h1><p>{bootError}</p><button type="button" onClick={() => void loadStatus()}>Try again</button></main>
   if (mode === 'loading') return <main className="boot-state"><Logo /><RefreshCw className="spin" size={23} /><p>Connecting the D1 vault…</p></main>
-  if (mode === 'setup' || mode === 'unlock') return <SetupScreen mode={mode} onConnected={(next) => { setStatus(next); setMode('dashboard') }} />
+  if (mode === 'setup') return <SetupScreen onConnected={(next) => { setStatus(next); setMode('dashboard') }} />
   if (!status?.account) return <main className="boot-state"><Logo /><Settings size={23} /><p>Account details are unavailable.</p></main>
   return <Dashboard account={status.account} />
 }

@@ -7,7 +7,6 @@ import App from './App'
 
 const status = {
   configured: true,
-  authenticated: true,
   account: { id: 'account-1234567890', name: 'Test Account' },
   database: 'connected',
   encryption: 'ready',
@@ -97,6 +96,14 @@ describe('Servers dashboard', () => {
     cleanup()
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
+  })
+
+  it('opens a configured instance directly through Cloudflare Access without an unlock prompt', async () => {
+    installApiMock()
+    render(<App />)
+
+    expect(await screen.findByRole('heading', { name: 'Workers' })).toBeInTheDocument()
+    expect(screen.queryByPlaceholderText('paste your token here')).not.toBeInTheDocument()
   })
 
   it('opens the unconfigured Servers workspace without changing the Workers flow', async () => {

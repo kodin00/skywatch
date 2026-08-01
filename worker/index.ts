@@ -1,6 +1,4 @@
 const API_ROOT = "https://api.cloudflare.com/client/v4";
-const SESSION_COOKIE = "skywatch_session";
-const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30;
 const ENCRYPTION_BINDING = "SKYWATCH_TOKEN_KEY";
 const TOKEN_AAD = new TextEncoder().encode("skywatch:cloudflare-api-token:v1");
 const AGENT_KEY_AAD = new TextEncoder().encode("skywatch:agent-hmac-key:v1");
@@ -141,29 +139,23 @@ export default {
       if (request.method !== "GET") assertSameOrigin(request);
 
       if (request.method === "GET" && url.pathname === "/api/status") {
-        return withHeaders(await getStatus(request, env));
+        return withHeaders(await getStatus(env));
       }
       if (request.method === "POST" && url.pathname === "/api/setup") {
         return withHeaders(await setup(request, env, url));
       }
-      if (request.method === "POST" && url.pathname === "/api/unlock") {
-        return withHeaders(await unlock(request, env));
-      }
-      if (request.method === "POST" && url.pathname === "/api/logout") {
-        return withHeaders(await logout(request, env));
-      }
       if (request.method === "POST" && url.pathname === "/api/protect-self") {
-        return withHeaders(await protectSelf(request, env, url));
+        return withHeaders(await protectSelf(env, url));
       }
       if (request.method === "GET" && url.pathname === "/api/workers") {
-        return withHeaders(await listWorkers(request, env));
+        return withHeaders(await listWorkers(env));
       }
       if (request.method === "PUT" && /^\/api\/workers\/[^/]+\/access$/.test(url.pathname)) {
         const workerId = decodeURIComponent(url.pathname.split("/")[3] ?? "");
         return withHeaders(await updateWorkerAccess(request, env, workerId));
       }
       if (url.pathname === "/api/servers" && request.method === "GET") {
-        return withHeaders(await listAgentConfigurations(request, env));
+        return withHeaders(await listAgentConfigurations(env));
       }
       if (url.pathname === "/api/servers" && request.method === "POST") {
         return withHeaders(await updateAgentConfiguration(request, env, null));
@@ -173,24 +165,23 @@ export default {
         return withHeaders(await updateAgentConfiguration(request, env, serverRoute.serverId));
       }
       if (serverRoute?.resource === "config" && request.method === "DELETE") {
-        return withHeaders(await deleteAgentConfiguration(request, env, serverRoute.serverId));
+        return withHeaders(await deleteAgentConfiguration(env, serverRoute.serverId));
       }
       if (serverRoute?.resource === "health" && request.method === "GET") {
-        return withHeaders(await proxyAgentRead(request, env, serverRoute.serverId, "/v1/health"));
+        return withHeaders(await proxyAgentRead(env, serverRoute.serverId, "/v1/health"));
       }
       if (serverRoute?.resource === "system" && request.method === "GET") {
-        return withHeaders(await proxyAgentRead(request, env, serverRoute.serverId, "/v1/system"));
+        return withHeaders(await proxyAgentRead(env, serverRoute.serverId, "/v1/system"));
       }
       if (serverRoute?.resource === "containers" && !serverRoute.containerId && request.method === "GET") {
-        return withHeaders(await proxyAgentRead(request, env, serverRoute.serverId, "/v1/containers"));
+        return withHeaders(await proxyAgentRead(env, serverRoute.serverId, "/v1/containers"));
       }
       if (serverRoute?.resource === "containers" && serverRoute.containerId && request.method === "GET" && serverRoute.operation === "inspect") {
-        return withHeaders(await proxyAgentRead(request, env, serverRoute.serverId, `/v1/containers/${encodeURIComponent(serverRoute.containerId)}`));
+        return withHeaders(await proxyAgentRead(env, serverRoute.serverId, `/v1/containers/${encodeURIComponent(serverRoute.containerId)}`));
       }
       if (serverRoute?.resource === "containers" && serverRoute.containerId && request.method === "GET" && serverRoute.operation === "logs") {
         const tail = parseLogTail(url.searchParams.get("tail"));
         return withHeaders(await proxyAgentRead(
-          request,
           env,
           serverRoute.serverId,
           `/v1/containers/${encodeURIComponent(serverRoute.containerId)}/logs?tail=${tail}`,
@@ -198,7 +189,7 @@ export default {
         ));
       }
       if (serverRoute?.resource === "containers" && serverRoute.containerId && request.method === "POST" && isContainerAction(serverRoute.operation)) {
-        return withHeaders(await proxyAgentMutation(request, env, serverRoute.serverId, serverRoute.containerId, serverRoute.operation));
+        return withHeaders(await proxyAgentMutation(env, serverRoute.serverId, serverRoute.containerId, serverRoute.operation));
       }
 
       return withHeaders(json({ error: "Route not found", code: "not_found" }, 404));
@@ -230,11 +221,6 @@ async function ensureSchema(db: D1Database): Promise<void> {
       token_iv TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )`),
-    db.prepare(`CREATE TABLE IF NOT EXISTS skywatch_sessions (
-      token_hash TEXT PRIMARY KEY,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      expires_at TEXT NOT NULL
     )`),
     db.prepare(`CREATE TABLE IF NOT EXISTS skywatch_setup_lock (
       id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -299,16 +285,14 @@ async function ensureSchema(db: D1Database): Promise<void> {
   ]);
 }
 
-async function getStatus(request: Request, env: RuntimeEnv): Promise<Response> {
+async function getStatus(env: RuntimeEnv): Promise<Response> {
   await ensureSchema(env.DB);
   const configuration = await readConfiguration(env.DB);
-  const authenticated = configuration ? await isAuthenticated(request, env.DB) : false;
   const encryption = await getEncryptionState(env, configuration);
 
   return json({
     configured: Boolean(configuration),
-    authenticated,
-    account: authenticated && configuration
+    account: configuration
       ? { id: configuration.account_id, name: configuration.account_name }
       : null,
     database: "connected",
@@ -319,7 +303,7 @@ async function getStatus(request: Request, env: RuntimeEnv): Promise<Response> {
 async function setup(request: Request, env: RuntimeEnv, url: URL): Promise<Response> {
   await ensureSchema(env.DB);
   if (await readConfiguration(env.DB)) {
-    throw new HttpError(409, "Skywatch is already configured. Unlock it with the original API token.", "already_configured");
+    throw new HttpError(409, "Skywatch is already configured.", "already_configured");
   }
 
   const body = await readJson<{ token?: unknown }>(request);
@@ -387,7 +371,6 @@ async function setup(request: Request, env: RuntimeEnv, url: URL): Promise<Respo
       .bind(account.id, account.name, bytesToBase64(new Uint8Array(encrypted)), bytesToBase64(iv))
       .run();
 
-    const sessionCookie = await createSession(env.DB);
     return json(
       {
         configured: true,
@@ -396,37 +379,13 @@ async function setup(request: Request, env: RuntimeEnv, url: URL): Promise<Respo
         protection: { email: owner.email, pending: true },
       },
       201,
-      { "Set-Cookie": sessionCookie },
     );
   } finally {
     await env.DB.prepare("DELETE FROM skywatch_setup_lock WHERE nonce = ?").bind(lockNonce).run();
   }
 }
 
-async function unlock(request: Request, env: RuntimeEnv): Promise<Response> {
-  await ensureSchema(env.DB);
-  const body = await readJson<{ token?: unknown }>(request);
-  const suppliedToken = typeof body.token === "string" ? body.token.trim() : "";
-  const storedToken = await decryptStoredToken(env);
-  const matches = await timingSafeStringEqual(suppliedToken, storedToken);
-  if (!matches) throw new HttpError(401, "That API token does not match this Skywatch instance.", "invalid_token");
-
-  const sessionCookie = await createSession(env.DB);
-  return json({ authenticated: true }, 200, { "Set-Cookie": sessionCookie });
-}
-
-async function logout(request: Request, env: RuntimeEnv): Promise<Response> {
-  const token = getCookie(request, SESSION_COOKIE);
-  if (token) {
-    await env.DB.prepare("DELETE FROM skywatch_sessions WHERE token_hash = ?").bind(await sha256Base64(token)).run();
-  }
-  return json({ authenticated: false }, 200, {
-    "Set-Cookie": `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`,
-  });
-}
-
-async function protectSelf(request: Request, env: RuntimeEnv, url: URL): Promise<Response> {
-  await requireAuthentication(request, env.DB);
+async function protectSelf(env: RuntimeEnv, url: URL): Promise<Response> {
   const config = await requireConfiguration(env.DB);
   const token = await decryptStoredToken(env);
   const owner = await getTokenOwner(token);
@@ -444,8 +403,7 @@ async function protectSelf(request: Request, env: RuntimeEnv, url: URL): Promise
   return json({ protected: true, ...protection });
 }
 
-async function listWorkers(request: Request, env: RuntimeEnv): Promise<Response> {
-  await requireAuthentication(request, env.DB);
+async function listWorkers(env: RuntimeEnv): Promise<Response> {
   const config = await requireConfiguration(env.DB);
   const token = await decryptStoredToken(env);
 
@@ -510,7 +468,6 @@ async function listWorkers(request: Request, env: RuntimeEnv): Promise<Response>
 }
 
 async function updateWorkerAccess(request: Request, env: RuntimeEnv, workerId: string): Promise<Response> {
-  await requireAuthentication(request, env.DB);
   const config = await requireConfiguration(env.DB);
   const token = await decryptStoredToken(env);
   const body = await readJson<{ mode?: unknown; emails?: unknown }>(request);
@@ -707,9 +664,8 @@ class AgentClient {
   }
 }
 
-async function listAgentConfigurations(request: Request, env: RuntimeEnv): Promise<Response> {
+async function listAgentConfigurations(env: RuntimeEnv): Promise<Response> {
   await ensureSchema(env.DB);
-  await requireAuthentication(request, env.DB);
   const configurations = await readAgentConfigurations(env.DB);
   return json({ servers: configurations.map(agentConfigurationResponse) });
 }
@@ -720,7 +676,6 @@ async function updateAgentConfiguration(
   expectedNodeId: string | null,
 ): Promise<Response> {
   await ensureSchema(env.DB);
-  await requireAuthentication(request, env.DB);
   const requestId = crypto.randomUUID();
   const startedAt = Date.now();
   const body = await readJson<{
@@ -873,9 +828,8 @@ async function updateAgentConfiguration(
   }
 }
 
-async function deleteAgentConfiguration(request: Request, env: RuntimeEnv, nodeId: string): Promise<Response> {
+async function deleteAgentConfiguration(env: RuntimeEnv, nodeId: string): Promise<Response> {
   await ensureSchema(env.DB);
-  await requireAuthentication(request, env.DB);
   const requestId = crypto.randomUUID();
   const startedAt = Date.now();
   const existing = await requireAgentConfiguration(env.DB, nodeId);
@@ -898,14 +852,12 @@ async function deleteAgentConfiguration(request: Request, env: RuntimeEnv, nodeI
 }
 
 async function proxyAgentRead(
-  request: Request,
   env: RuntimeEnv,
   nodeId: string,
   pathAndQuery: string,
   maxBytes = AGENT_MAX_RESPONSE_BYTES,
 ): Promise<Response> {
   await ensureSchema(env.DB);
-  await requireAuthentication(request, env.DB);
   const config = await requireAgentConfiguration(env.DB, nodeId);
   const client = await AgentClient.fromStored(env, config);
   const response = await client.request<unknown>(pathAndQuery, "GET", undefined, AGENT_READ_TIMEOUT_MS, maxBytes);
@@ -913,14 +865,12 @@ async function proxyAgentRead(
 }
 
 async function proxyAgentMutation(
-  request: Request,
   env: RuntimeEnv,
   nodeId: string,
   containerId: string,
   action: "start" | "stop" | "restart",
 ): Promise<Response> {
   await ensureSchema(env.DB);
-  await requireAuthentication(request, env.DB);
   const config = await requireAgentConfiguration(env.DB, nodeId);
   const requestId = crypto.randomUUID();
   const startedAt = Date.now();
@@ -1944,30 +1894,6 @@ function agentErrorCode(error: unknown): string {
   return error instanceof HttpError ? error.code : "internal_error";
 }
 
-async function createSession(db: D1Database): Promise<string> {
-  const token = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
-  const hash = await sha256Base64(token);
-  const expiresAt = new Date(Date.now() + SESSION_TTL_SECONDS * 1000).toISOString();
-  await db.prepare("DELETE FROM skywatch_sessions WHERE expires_at <= CURRENT_TIMESTAMP").run();
-  await db.prepare("INSERT INTO skywatch_sessions (token_hash, expires_at) VALUES (?, ?)").bind(hash, expiresAt).run();
-  return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_TTL_SECONDS}`;
-}
-
-async function isAuthenticated(request: Request, db: D1Database): Promise<boolean> {
-  const token = getCookie(request, SESSION_COOKIE);
-  if (!token) return false;
-  const row = await db.prepare(
-    "SELECT 1 AS valid FROM skywatch_sessions WHERE token_hash = ? AND expires_at > CURRENT_TIMESTAMP",
-  ).bind(await sha256Base64(token)).first<{ valid: number }>();
-  return row?.valid === 1;
-}
-
-async function requireAuthentication(request: Request, db: D1Database): Promise<void> {
-  if (!(await isAuthenticated(request, db))) {
-    throw new HttpError(401, "Unlock Skywatch to continue.", "authentication_required");
-  }
-}
-
 function workerHostnames(worker: WorkerRecord, domains: WorkerDomain[], accountSubdomain?: string): string[] {
   const serviceNames = new Set([worker.id, worker.script_name, worker.service_name].filter(Boolean));
   const hostnames = domains
@@ -2083,15 +2009,6 @@ async function readJson<T>(request: Request): Promise<T> {
     if (error instanceof HttpError) throw error;
     throw new HttpError(400, "Request body is not valid JSON.", "invalid_json");
   }
-}
-
-function getCookie(request: Request, name: string): string | null {
-  const cookies = request.headers.get("Cookie") ?? "";
-  for (const item of cookies.split(";")) {
-    const [key, ...parts] = item.trim().split("=");
-    if (key === name) return parts.join("=");
-  }
-  return null;
 }
 
 async function sha256Base64(value: string): Promise<string> {
