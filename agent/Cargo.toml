@@ -1,0 +1,36 @@
+[package]
+name = "skywatch-agent"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Hardened VPS metrics and Docker control agent for Skywatch"
+
+[dependencies]
+axum = { version = "0.8", features = ["json"] }
+async-trait = "0.1"
+base64 = "0.22"
+bollard = "0.20"
+clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3"
+hmac = "0.12"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sysinfo = "0.38"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.9"
+tower = { version = "0.5", features = ["limit", "timeout", "util"] }
+tower-http = { version = "0.6", features = ["catch-panic", "limit", "sensitive-headers", "timeout", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true

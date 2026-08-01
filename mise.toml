@@ -1,0 +1,104 @@
+min_version = "2026.6.14"
+
+[tools]
+node = "24.18.1"
+rust = "1.97.1"
+
+[tasks.setup]
+description = "Install web dependencies and fetch Rust dependencies"
+run = [
+  "npm ci",
+  "cargo fetch --manifest-path agent/Cargo.toml",
+]
+
+[tasks."web:dev"]
+description = "Run the Skywatch dashboard locally"
+run = "npm run dev"
+
+[tasks."web:build"]
+description = "Build the Worker dashboard"
+run = "npm run build"
+
+[tasks."web:check"]
+description = "Type-check, build, and dry-run the Worker deployment"
+run = "npm run check"
+
+[tasks."web:deploy"]
+description = "Deploy Skywatch to Cloudflare"
+run = "npm run deploy"
+
+[tasks."agent:dev"]
+description = "Run the VPS agent with the development configuration"
+dir = "agent"
+run = "cargo run -- serve --config config.toml"
+
+[tasks."agent:init"]
+description = "Generate a VPS agent configuration and signing key"
+dir = "agent"
+run = "cargo run -- init"
+
+[tasks."agent:fmt"]
+description = "Check Rust formatting"
+dir = "agent"
+run = "cargo fmt --all -- --check"
+
+[tasks."agent:lint"]
+description = "Lint every Rust target"
+dir = "agent"
+run = "cargo clippy --all-targets --all-features -- -D warnings"
+
+[tasks."agent:test"]
+description = "Run Rust agent tests"
+dir = "agent"
+run = "cargo test --all-targets --all-features"
+
+[tasks."agent:build"]
+description = "Build the optimized VPS agent binary"
+dir = "agent"
+run = "cargo build --release"
+
+[tasks.build]
+description = "Build the dashboard and a development agent binary"
+run = [
+  "npm run build",
+  "cargo build --manifest-path agent/Cargo.toml",
+]
+
+[tasks.format]
+description = "Format the Rust agent"
+run = "cargo fmt --manifest-path agent/Cargo.toml --all"
+
+[tasks.clippy]
+description = "Run Rust Clippy with warnings denied"
+run = "cargo clippy --manifest-path agent/Cargo.toml --all-targets --all-features -- -D warnings"
+
+[tasks.test]
+description = "Run dashboard, Worker, and Rust tests"
+run = [
+  "npm run test",
+  "cargo test --manifest-path agent/Cargo.toml --all-targets --all-features",
+]
+
+[tasks.release]
+description = "Build production dashboard assets and the optimized agent binary"
+run = [
+  "npm run build",
+  "cargo build --manifest-path agent/Cargo.toml --release",
+]
+
+[tasks."agent:check"]
+description = "Format, lint, test, and release-build the VPS agent"
+dir = "agent"
+run = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --all-targets --all-features -- -D warnings",
+  "cargo test --all-targets --all-features",
+  "cargo build --release",
+]
+
+[tasks.check]
+description = "Verify the dashboard, Worker, and VPS agent"
+run = [
+  "npm run check",
+  "mise run agent:check",
+]

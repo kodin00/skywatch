@@ -53,14 +53,64 @@ npx wrangler dev
 
 Wrangler uses a local D1 database by default. The full encryption-key bootstrap calls the Cloudflare API and is intended for a deployed `skywatch` Worker, so do not submit a production token from local development unless that is intentional.
 
+### Reproducible toolchains with mise
+
+Skywatch pins Node.js and Rust in `mise.toml`. To prepare both the dashboard and the VPS agent:
+
+```bash
+mise install
+mise run setup
+mise run web:dev
+```
+
+Run `mise run agent:dev` in a second terminal after generating a development agent configuration with `mise run agent:init`.
+
+## VPS agent
+
+The optional Rust agent in [`agent/`](./agent/) adds live host metrics and bounded Docker controls to the Servers view. The browser never talks to the agent directly: Skywatch's Worker signs every request and selects one configured transport without automatic fallback.
+
+On a Linux VPS with Docker and systemd, install and start it with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kodin00/skywatch/master/agent/install.sh | sudo bash
+```
+
+The installer builds with the pinned Rust toolchain inside Docker, installs the hardened systemd service, and prints the pairing key needed by the Servers view. It binds to `127.0.0.1:8788` unless explicitly configured otherwise.
+
+- **Workers VPC Service:** private Worker-to-agent routing through `cloudflared`. The agent can remain on `127.0.0.1:8788`.
+- **Public Cloudflare Tunnel URL:** normal HTTPS `fetch()` through a public tunnel hostname to the same loopback listener.
+- **Public VPS IP over HTTP:** an explicit unsafe escape hatch. It requires opt-in on both the agent and dashboard and does not encrypt metrics, logs, or action metadata.
+
+Follow [`agent/README.md`](./agent/README.md) for agent initialization, systemd installation, and transport-specific setup. The signing key is shown only during initialization; paste it into the Servers connection form, where Skywatch encrypts it using the same Worker-only key separation used for the Cloudflare token.
+
+### Workers VPC binding
+
+VPC Service IDs are installation-specific, so Skywatch does not commit a placeholder binding. After creating an HTTP VPC Service for `localhost:8788`, add its ID to the deployed Worker's Wrangler configuration or binding settings:
+
+```jsonc
+{
+  "vpc_services": [
+    {
+      "binding": "VPS_AGENT",
+      "service_id": "<YOUR_VPC_SERVICE_ID>",
+      "remote": true
+    }
+  ]
+}
+```
+
+Creating a VPC Service requires the Connectivity Directory Admin role; binding an existing service requires Connectivity Directory Bind. This is provisioned separately, so the Cloudflare API token stored by Skywatch does not need those additional permissions.
+
 ## Commands
 
 ```bash
 npm run dev          # Vite frontend development
 npm run build        # TypeScript + production frontend bundle
+npm run test         # Worker and dashboard tests
 npm run cf-typegen   # Regenerate types from wrangler.jsonc
 npm run check        # Types, build inputs, and Wrangler dry run
 npm run deploy       # Build and deploy to Cloudflare
+mise run check       # Verify the Worker, dashboard, and Rust agent
 ```
 
 ## Security model

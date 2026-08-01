@@ -1,0 +1,25 @@
+# Generate real UUIDs and a 32-byte key with the init command.
+node_id = "00000000-0000-4000-8000-000000000000"
+node_name = "my-vps"
+listen = "127.0.0.1:8788"
+
+# Keep false when cloudflared or an HTTPS reverse proxy reaches the loopback listener.
+# Setting this true on a public listener gives up transport confidentiality. HMAC still
+# authenticates and integrity-protects messages, but metrics and logs remain readable in transit.
+allow_insecure_public_http = false
+
+key_id = "00000000-0000-4000-8000-000000000001"
+key_file = "skywatch-agent.key"
+docker_socket = "/var/run/docker.sock"
+
+sample_interval_seconds = 5
+clock_skew_seconds = 60
+nonce_ttl_seconds = 120
+nonce_capacity = 10000
+request_timeout_seconds = 15
+docker_timeout_seconds = 30
+request_concurrency = 32
+stats_concurrency = 4
+log_tail_default = 200
+log_tail_max = 1000
+log_bytes_max = 1048576

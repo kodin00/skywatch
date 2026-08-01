@@ -1,21 +1,35 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import {
+  Activity,
+  AlertTriangle,
   ArrowRight,
+  Box,
   Check,
   ChevronDown,
   Cloud,
+  Cpu,
   Database,
   Globe2,
+  HardDrive,
   KeyRound,
   LayoutGrid,
   LockKeyhole,
+  MemoryStick,
   Menu,
   MoreHorizontal,
+  Play,
   RefreshCw,
+  RotateCw,
   Search,
+  Server,
   Settings,
   ShieldCheck,
+  Square,
+  Terminal,
+  Trash2,
   Users,
+  Wifi,
+  WifiOff,
   X,
 } from 'lucide-react'
 
@@ -54,6 +68,47 @@ type SeatUsage = {
 
 type WorkersResponse = { workers: Worker[]; seatUsage: SeatUsage; syncedAt: string }
 type ApiError = { error?: string; code?: string }
+
+type AgentTransport = 'vpc' | 'direct'
+type AgentNode = { id: string; name: string; agentVersion?: string }
+type AgentConfig = {
+  configured: boolean
+  transport: AgentTransport | null
+  endpoint: string | null
+  allowInsecureHttp: boolean
+  node: AgentNode | null
+  connectedAt: string | null
+  updatedAt: string | null
+}
+type AgentHealth = {
+  status: 'ok' | 'degraded'
+  node: { id: string; name: string }
+  agentVersion: string
+  uptimeSeconds: number
+  dockerAvailable?: boolean
+  collectedAt?: string
+}
+type AgentSystem = {
+  node: { id: string; name: string }
+  cpu: { usagePercent: number; cores: number }
+  memory: { usedBytes: number; totalBytes: number }
+  storage: Array<{ mount: string; usedBytes: number; totalBytes: number }>
+  load: { one: number; five: number; fifteen: number }
+  uptimeSeconds: number
+  collectedAt: string
+}
+type AgentContainer = {
+  id: string
+  name: string
+  image: string
+  state: string
+  status: string
+  createdAt: string | null
+  startedAt: string | null
+  ports: Array<{ privatePort: number; publicPort: number | null; type: string }>
+}
+type ContainersResponse = { containers: AgentContainer[]; collectedAt: string }
+type AgentAction = 'start' | 'stop' | 'restart'
 
 const setupTasks = [
   { label: 'Prepare encrypted D1 vault', icon: Database },
@@ -267,6 +322,36 @@ function relativeDate(value: string | null): string {
   return `${Math.floor(seconds / 86400)}d ago`
 }
 
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const power = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1)
+  return `${(value / 1024 ** power).toFixed(power < 2 ? 0 : 1)} ${units[power]}`
+}
+
+function formatUptime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return 'Unknown'
+  const days = Math.floor(seconds / 86400)
+  const hours = Math.floor(seconds % 86400 / 3600)
+  const minutes = Math.floor(seconds % 3600 / 60)
+  if (days > 0) return `${days}d ${hours}h`
+  if (hours > 0) return `${hours}h ${minutes}m`
+  return `${minutes}m`
+}
+
+function boundedPercent(used: number, total: number): number {
+  if (!Number.isFinite(used) || !Number.isFinite(total) || total <= 0) return 0
+  return Math.max(0, Math.min(100, used / total * 100))
+}
+
+function isInsecureHttpEndpoint(endpoint: string): boolean {
+  try {
+    return new URL(endpoint).protocol === 'http:'
+  } catch {
+    return endpoint.trim().toLowerCase().startsWith('http:')
+  }
+}
+
 function AccessDialog({ worker, onClose, onSaved }: { worker: Worker; onClose: () => void; onSaved: () => Promise<void> }) {
   const [mode, setMode] = useState<AccessType>(worker.accessStatus)
   const [emails, setEmails] = useState(worker.emails.join('\n'))
@@ -305,7 +390,311 @@ function AccessDialog({ worker, onClose, onSaved }: { worker: Worker; onClose: (
   </div>
 }
 
+function ConfirmAgentActionDialog({ container, action, busy, error, onClose, onConfirm }: {
+  container: AgentContainer
+  action: AgentAction
+  busy: boolean
+  error: string
+  onClose: () => void
+  onConfirm: () => void
+}) {
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (!busy && event.target === event.currentTarget) onClose() }}>
+    <section className="access-dialog action-dialog" role="alertdialog" aria-modal="true" aria-labelledby="agent-action-title" aria-describedby="agent-action-description">
+      <header><div><span className="eyebrow"><span /> Confirm container action</span><h2 id="agent-action-title">{action[0].toUpperCase() + action.slice(1)} {container.name}</h2></div><button type="button" disabled={busy} onClick={onClose} aria-label="Close"><X size={18} /></button></header>
+      <p id="agent-action-description">Skywatch will send this action once. It will not retry if the result is uncertain.</p>
+      <div className="action-target"><Box size={17} /><span><strong>{container.name}</strong><small>{container.image}</small></span></div>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <footer><button type="button" className="dialog-cancel" disabled={busy} onClick={onClose}>Cancel</button><button type="button" className={`dialog-save ${action === 'stop' ? 'danger' : ''}`} disabled={busy} onClick={onConfirm}>{busy ? `${action[0].toUpperCase() + action.slice(1)}ing…` : `Confirm ${action}`}</button></footer>
+    </section>
+  </div>
+}
+
+function ContainerLogsDialog({ container, onClose }: { container: AgentContainer; onClose: () => void }) {
+  const [tail, setTail] = useState(200)
+  const [logs, setLogs] = useState('')
+  const [truncated, setTruncated] = useState(false)
+  const [collectedAt, setCollectedAt] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+
+  const loadLogs = useCallback(async () => {
+    setLoading(true)
+    setError('')
+    try {
+      const result = await api<{ containerId: string; logs: string; truncated: boolean; collectedAt: string }>(
+        `/api/agent/containers/${encodeURIComponent(container.id)}/logs?tail=${tail}`,
+      )
+      setLogs(result.logs)
+      setTruncated(result.truncated)
+      setCollectedAt(result.collectedAt)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Container logs could not be loaded.')
+    } finally {
+      setLoading(false)
+    }
+  }, [container.id, tail])
+
+  useEffect(() => { void loadLogs() }, [loadLogs])
+
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+    <section className="access-dialog logs-dialog" role="dialog" aria-modal="true" aria-labelledby="container-logs-title">
+      <header><div><span className="eyebrow"><span /> Finite log snapshot</span><h2 id="container-logs-title">{container.name}</h2></div><button type="button" onClick={onClose} aria-label="Close"><X size={18} /></button></header>
+      <div className="logs-toolbar">
+        <label>Tail<select value={tail} onChange={(event) => setTail(Number(event.target.value))}>{[100, 200, 500, 1000].map((value) => <option value={value} key={value}>{value} lines</option>)}</select></label>
+        <button className="secondary-button" type="button" disabled={loading} onClick={() => void loadLogs()}><RefreshCw size={15} className={loading ? 'spin' : ''} /> Refresh</button>
+      </div>
+      {error && <div className="dashboard-error" role="alert"><span>{error}</span><button type="button" onClick={() => void loadLogs()}>Try again</button></div>}
+      <pre className="log-output" aria-busy={loading}>{loading && !logs ? 'Loading finite log snapshot…' : logs || 'No log lines returned.'}</pre>
+      <footer className="logs-footer"><span>{truncated ? 'Response capped by the agent · ' : ''}{collectedAt ? `Captured ${relativeDate(collectedAt)}` : 'Not streaming'}</span><button type="button" className="dialog-cancel" onClick={onClose}>Close</button></footer>
+    </section>
+  </div>
+}
+
+function ServersDashboard() {
+  const [config, setConfig] = useState<AgentConfig | null>(null)
+  const [transport, setTransport] = useState<AgentTransport>('vpc')
+  const [endpoint, setEndpoint] = useState('http://skywatch-agent.internal')
+  const [pairingToken, setPairingToken] = useState('')
+  const [allowInsecureHttp, setAllowInsecureHttp] = useState(false)
+  const [showConfig, setShowConfig] = useState(true)
+  const [configLoading, setConfigLoading] = useState(true)
+  const [configSaving, setConfigSaving] = useState(false)
+  const [configError, setConfigError] = useState('')
+  const [health, setHealth] = useState<AgentHealth | null>(null)
+  const [system, setSystem] = useState<AgentSystem | null>(null)
+  const [containers, setContainers] = useState<AgentContainer[]>([])
+  const [containersAt, setContainersAt] = useState<string | null>(null)
+  const [polling, setPolling] = useState(false)
+  const [pollError, setPollError] = useState('')
+  const [lastSuccessAt, setLastSuccessAt] = useState<string | null>(null)
+  const [pendingAction, setPendingAction] = useState<{ container: AgentContainer; action: AgentAction } | null>(null)
+  const [actionBusy, setActionBusy] = useState(false)
+  const [actionError, setActionError] = useState('')
+  const [logsContainer, setLogsContainer] = useState<AgentContainer | null>(null)
+  const pollInFlight = useRef(false)
+
+  useEffect(() => {
+    let cancelled = false
+    const loadConfig = async () => {
+      setConfigLoading(true)
+      setConfigError('')
+      try {
+        const result = await api<AgentConfig>('/api/agent/config')
+        if (cancelled) return
+        setConfig(result)
+        setShowConfig(!result.configured)
+        if (result.transport) setTransport(result.transport)
+        if (result.endpoint) setEndpoint(result.endpoint)
+        setAllowInsecureHttp(result.allowInsecureHttp)
+      } catch (caught) {
+        if (!cancelled) setConfigError(caught instanceof Error ? caught.message : 'Agent configuration could not be loaded.')
+      } finally {
+        if (!cancelled) setConfigLoading(false)
+      }
+    }
+    void loadConfig()
+    return () => { cancelled = true }
+  }, [])
+
+  const fetchLive = useCallback(async (): Promise<boolean> => {
+    if (pollInFlight.current) return false
+    pollInFlight.current = true
+    setPolling(true)
+    const [healthResult, systemResult, containersResult] = await Promise.allSettled([
+      api<AgentHealth>('/api/agent/health'),
+      api<AgentSystem>('/api/agent/system'),
+      api<ContainersResponse>('/api/agent/containers'),
+    ])
+    let firstError = ''
+    if (healthResult.status === 'fulfilled') setHealth(healthResult.value)
+    else firstError ||= healthResult.reason instanceof Error ? healthResult.reason.message : 'Agent health is unavailable.'
+    if (systemResult.status === 'fulfilled') setSystem(systemResult.value)
+    else firstError ||= systemResult.reason instanceof Error ? systemResult.reason.message : 'System metrics are unavailable.'
+    if (containersResult.status === 'fulfilled') {
+      setContainers(containersResult.value.containers)
+      setContainersAt(containersResult.value.collectedAt)
+    } else firstError ||= containersResult.reason instanceof Error ? containersResult.reason.message : 'Containers are unavailable.'
+    const successful = !firstError
+    if (successful) {
+      setPollError('')
+      setLastSuccessAt(new Date().toISOString())
+    } else {
+      setPollError(firstError)
+    }
+    pollInFlight.current = false
+    setPolling(false)
+    return successful
+  }, [])
+
+  useEffect(() => {
+    if (!config?.configured) return
+    let stopped = false
+    let timer: number | undefined
+    let failures = 0
+    const schedule = (delay: number) => {
+      window.clearTimeout(timer)
+      if (!stopped && document.visibilityState === 'visible') timer = window.setTimeout(() => void cycle(), delay)
+    }
+    const cycle = async () => {
+      if (stopped || document.visibilityState !== 'visible') return
+      const successful = await fetchLive()
+      failures = successful ? 0 : Math.min(failures + 1, 4)
+      schedule(successful ? 5000 : Math.min(60_000, 5000 * 2 ** failures))
+    }
+    const visibilityChanged = () => {
+      window.clearTimeout(timer)
+      if (document.visibilityState === 'visible') void cycle()
+    }
+    document.addEventListener('visibilitychange', visibilityChanged)
+    void cycle()
+    return () => {
+      stopped = true
+      window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', visibilityChanged)
+    }
+  }, [config?.configured, fetchLive])
+
+  const selectTransport = (next: AgentTransport) => {
+    setTransport(next)
+    setAllowInsecureHttp(false)
+    if (next === 'vpc' && (!endpoint || endpoint === 'https://agent.example.com')) setEndpoint('http://skywatch-agent.internal')
+    if (next === 'direct' && (!endpoint || endpoint === 'http://skywatch-agent.internal')) setEndpoint('https://agent.example.com')
+  }
+
+  const saveConfig = async () => {
+    setConfigSaving(true)
+    setConfigError('')
+    try {
+      const result = await api<AgentConfig>('/api/agent/config', {
+        method: 'PUT',
+        body: JSON.stringify({ transport, endpoint: endpoint.trim(), pairingToken: pairingToken.trim(), ...(isInsecureHttpEndpoint(endpoint) ? { allowInsecureHttp } : {}) }),
+      })
+      setConfig(result)
+      setAllowInsecureHttp(result.allowInsecureHttp)
+      setPairingToken('')
+      setShowConfig(false)
+      setPollError('')
+    } catch (caught) {
+      setConfigError(caught instanceof Error ? caught.message : 'The agent connection could not be saved.')
+    } finally {
+      setConfigSaving(false)
+    }
+  }
+
+  const deleteConfig = async () => {
+    if (!window.confirm('Disconnect this server from Skywatch? The agent keeps running, and Skywatch will remove its stored pairing credentials.')) return
+    setConfigSaving(true)
+    setConfigError('')
+    try {
+      const result = await api<AgentConfig>('/api/agent/config', { method: 'DELETE' })
+      setConfig(result)
+      setHealth(null)
+      setSystem(null)
+      setContainers([])
+      setContainersAt(null)
+      setLastSuccessAt(null)
+      setShowConfig(true)
+    } catch (caught) {
+      setConfigError(caught instanceof Error ? caught.message : 'The agent connection could not be deleted.')
+    } finally {
+      setConfigSaving(false)
+    }
+  }
+
+  const runAction = async () => {
+    if (!pendingAction || actionBusy) return
+    setActionBusy(true)
+    setActionError('')
+    try {
+      const result = await api<{ action: AgentAction; container: AgentContainer; completedAt: string }>(
+        `/api/agent/containers/${encodeURIComponent(pendingAction.container.id)}/${pendingAction.action}`,
+        { method: 'POST', body: '{}' },
+      )
+      setContainers((current) => current.map((container) => container.id === result.container.id ? result.container : container))
+      setPendingAction(null)
+      void fetchLive()
+    } catch (caught) {
+      setActionError(caught instanceof Error ? caught.message : 'The container action could not be completed.')
+    } finally {
+      setActionBusy(false)
+    }
+  }
+
+  const insecureHttp = transport === 'direct' && isInsecureHttpEndpoint(endpoint)
+  const canSave = endpoint.trim().length > 0 && (config?.configured || pairingToken.trim().length > 0) && (!insecureHttp || allowInsecureHttp)
+  const storage = system?.storage.find((disk) => disk.mount === '/') ?? system?.storage[0]
+  const runningCount = containers.filter((container) => container.state.toLowerCase() === 'running').length
+  const stale = Boolean(pollError && lastSuccessAt)
+  const healthDegraded = health?.status === 'degraded' || health?.dockerAvailable === false
+
+  return <div className="content servers-content">
+    <div className="page-heading servers-heading">
+      <div><span className="eyebrow"><span /> Host control plane</span><h1>Servers</h1><p>Live host metrics and bounded Docker controls through the Skywatch agent.</p></div>
+      {config?.configured && <div className={`agent-state ${pollError || healthDegraded ? 'degraded' : 'online'}`}>{pollError || healthDegraded ? <WifiOff size={14} /> : <Wifi size={14} />}<span><strong>{pollError ? stale ? 'Stale data' : 'Agent unavailable' : healthDegraded ? 'Docker degraded' : 'Agent connected'}</strong>{lastSuccessAt ? `Updated ${relativeDate(lastSuccessAt)}` : 'Waiting for first sample'}</span></div>}
+    </div>
+
+    {configError && <div className="dashboard-error" role="alert"><span>{configError}</span></div>}
+
+    {config?.configured && !showConfig && <section className="agent-connection-card">
+      <div className="connection-identity"><span className="server-mark"><Server size={21} /></span><div><span className="eyebrow"><span /> Paired node</span><h2>{config.node?.name ?? 'Skywatch agent'}</h2><p>{config.node?.id ?? 'Node identity pending'}</p></div></div>
+      <dl><div><dt>Transport</dt><dd><span className={`transport-tag ${config.transport} ${config.transport === 'direct' && isInsecureHttpEndpoint(config.endpoint ?? '') ? 'unsafe' : ''}`}>{config.transport === 'vpc' ? 'VPC tunnel' : isInsecureHttpEndpoint(config.endpoint ?? '') ? 'Direct HTTP · Unsafe' : 'Direct HTTPS'}</span></dd></div><div><dt>Endpoint</dt><dd>{config.endpoint}</dd></div><div><dt>Agent</dt><dd>{config.node?.agentVersion ?? health?.agentVersion ?? 'Checking…'}</dd></div></dl>
+      <div className="connection-actions"><button type="button" className="secondary-button" onClick={() => setShowConfig(true)}><Settings size={15} /> Edit</button><button type="button" className="icon-button danger-icon" disabled={configSaving} onClick={() => void deleteConfig()} aria-label="Delete agent connection"><Trash2 size={16} /></button></div>
+    </section>}
+
+    {(!config?.configured || showConfig) && <section className="agent-config-panel" aria-busy={configLoading || configSaving}>
+      <header><div><span className="eyebrow"><span /> Connection settings</span><h2>{config?.configured ? 'Update the agent route' : 'Connect your first server'}</h2><p>The same authenticated agent protocol works over a private VPC Service or a public endpoint.</p></div>{config?.configured && <button className="icon-button" type="button" onClick={() => setShowConfig(false)} aria-label="Close connection settings"><X size={17} /></button>}</header>
+      <div className="transport-switch" role="radiogroup" aria-label="Agent transport">
+        <button type="button" role="radio" aria-checked={transport === 'vpc'} className={transport === 'vpc' ? 'active' : ''} onClick={() => selectTransport('vpc')}><Cloud size={18} /><span><strong>Cloudflare VPC</strong><small>Private, outbound-only tunnel</small></span><em>Recommended</em></button>
+        <button type="button" role="radio" aria-checked={transport === 'direct'} className={transport === 'direct' ? 'active' : ''} onClick={() => selectTransport('direct')}><Globe2 size={18} /><span><strong>Direct endpoint</strong><small>Public HTTPS to the VPS</small></span></button>
+      </div>
+      <div className="agent-fields">
+        <label><span>{transport === 'vpc' ? 'Tunnel request URL' : 'Public agent URL'}</span><input type="url" spellCheck="false" value={endpoint} onChange={(event) => { setEndpoint(event.target.value); setAllowInsecureHttp(false) }} placeholder={transport === 'vpc' ? 'http://skywatch-agent.internal' : 'https://agent.example.com'} /><small>{transport === 'vpc' ? 'The VPC Service binding fixes the real destination; this URL supplies the agent Host header and HTTPS SNI.' : 'Use HTTPS with a certificate valid for this hostname or literal IP. Redirects are rejected.'}</small></label>
+        <label><span>Agent pairing key</span><input type="password" autoComplete="new-password" spellCheck="false" value={pairingToken} onChange={(event) => setPairingToken(event.target.value)} placeholder={config?.configured ? 'Leave blank to keep the encrypted key' : 'key-id.base64url-secret'} /><small>{config?.configured ? 'Leave blank to reuse the encrypted key. A replacement is stored encrypted and never returned.' : 'Used to test signed health, then stored encrypted. It is never returned by Skywatch.'}</small></label>
+      </div>
+      {insecureHttp && <div className="insecure-warning" role="alert"><AlertTriangle size={18} /><div><strong>HTTP exposes control traffic on the public internet.</strong><p>Only literal public IP addresses can use this escape hatch. Metrics, logs, and action metadata are not encrypted; HMAC authenticates and integrity-protects them, but does not provide confidentiality.</p><label><input type="checkbox" checked={allowInsecureHttp} onChange={(event) => setAllowInsecureHttp(event.target.checked)} /> I understand the risk and want to allow insecure HTTP.</label></div></div>}
+      <footer><span>{configLoading ? 'Loading current connection…' : 'The candidate is health-checked before Skywatch switches routes.'}</span><button className="dialog-save" type="button" disabled={configLoading || configSaving || !canSave} onClick={() => void saveConfig()}>{configSaving ? 'Testing connection…' : config?.configured ? 'Test and update' : 'Test and connect'}</button></footer>
+    </section>}
+
+    {config?.configured && <>
+      {pollError && <div className="dashboard-error stale-error" role="alert"><span>{pollError}{lastSuccessAt ? ` Showing the last successful sample from ${relativeDate(lastSuccessAt)}.` : ''}</span><button type="button" disabled={polling} onClick={() => void fetchLive()}>Retry now</button></div>}
+      <div className="server-toolbar"><div><span className="result-count">Auto-refreshes every 5 seconds while this tab is visible</span>{polling && <RefreshCw className="spin" size={13} />}</div><button className="secondary-button" type="button" disabled={polling} onClick={() => void fetchLive()}><RefreshCw size={15} className={polling ? 'spin' : ''} /> Refresh now</button></div>
+
+      <section className="metrics-grid" aria-label="Server metrics" aria-busy={polling && !system}>
+        <article><span className="metric-icon"><Cpu size={18} /></span><div><span>CPU usage</span><strong>{system ? `${system.cpu.usagePercent.toFixed(1)}%` : '—'}</strong><small>{system ? `${system.cpu.cores} logical cores` : 'Waiting for metrics'}</small></div><i style={{ '--metric-fill': `${system?.cpu.usagePercent ?? 0}%` } as CSSProperties} /></article>
+        <article><span className="metric-icon"><MemoryStick size={18} /></span><div><span>Memory</span><strong>{system ? `${boundedPercent(system.memory.usedBytes, system.memory.totalBytes).toFixed(1)}%` : '—'}</strong><small>{system ? `${formatBytes(system.memory.usedBytes)} of ${formatBytes(system.memory.totalBytes)}` : 'Waiting for metrics'}</small></div><i style={{ '--metric-fill': `${system ? boundedPercent(system.memory.usedBytes, system.memory.totalBytes) : 0}%` } as CSSProperties} /></article>
+        <article><span className="metric-icon"><HardDrive size={18} /></span><div><span>Storage {storage?.mount ? `· ${storage.mount}` : ''}</span><strong>{storage ? `${boundedPercent(storage.usedBytes, storage.totalBytes).toFixed(1)}%` : '—'}</strong><small>{storage ? `${formatBytes(storage.usedBytes)} of ${formatBytes(storage.totalBytes)}` : 'Waiting for metrics'}</small></div><i style={{ '--metric-fill': `${storage ? boundedPercent(storage.usedBytes, storage.totalBytes) : 0}%` } as CSSProperties} /></article>
+        <article><span className="metric-icon"><Activity size={18} /></span><div><span>Load average</span><strong>{system ? system.load.one.toFixed(2) : '—'}</strong><small>{system ? `${system.load.five.toFixed(2)} · ${system.load.fifteen.toFixed(2)} · up ${formatUptime(system.uptimeSeconds)}` : 'Waiting for metrics'}</small></div></article>
+      </section>
+
+      <section className="containers-section">
+        <header><div><span className="eyebrow"><span /> Docker inventory</span><h2>Containers</h2><p>{runningCount} running · {containers.length - runningCount} stopped · {containersAt ? `sampled ${relativeDate(containersAt)}` : 'waiting for agent'}</p></div><span className="container-count"><Box size={15} /> {containers.length}</span></header>
+        <div className="container-list">
+          {!system && containers.length === 0 && polling && <div className="empty-state"><RefreshCw className="spin" size={22} /><h2>Reading server state</h2><p>The first signed metrics request is in flight.</p></div>}
+          {!polling && containers.length === 0 && !pollError && <div className="empty-state"><Box size={22} /><h2>No containers found</h2><p>The agent is connected, but Docker returned an empty inventory.</p></div>}
+          {containers.map((container) => {
+            const running = container.state.toLowerCase() === 'running'
+            return <article className="container-card" key={container.id}>
+              <span className={`container-state-dot ${running ? 'running' : 'stopped'}`} aria-label={container.state} />
+              <div className="container-primary"><span className="container-icon"><Box size={18} /></span><div><h3>{container.name}</h3><p>{container.image}</p></div></div>
+              <div className="container-status"><span className={`state-badge ${running ? 'running' : 'stopped'}`}>{container.state}</span><small>{container.status}</small></div>
+              <div className="container-ports"><span>Ports</span><strong>{container.ports.length ? container.ports.slice(0, 2).map((port) => `${port.publicPort ?? '—'}:${port.privatePort}/${port.type}`).join(' · ') : 'None exposed'}</strong></div>
+              <div className="container-actions">
+                <button type="button" onClick={() => setLogsContainer(container)}><Terminal size={15} /> Logs</button>
+                {running ? <><button type="button" onClick={() => { setActionError(''); setPendingAction({ container, action: 'restart' }) }}><RotateCw size={15} /> Restart</button><button type="button" className="danger" onClick={() => { setActionError(''); setPendingAction({ container, action: 'stop' }) }}><Square size={14} /> Stop</button></> : <button type="button" onClick={() => { setActionError(''); setPendingAction({ container, action: 'start' }) }}><Play size={15} /> Start</button>}
+              </div>
+            </article>
+          })}
+        </div>
+      </section>
+    </>}
+
+    {pendingAction && <ConfirmAgentActionDialog container={pendingAction.container} action={pendingAction.action} busy={actionBusy} error={actionError} onClose={() => { if (!actionBusy) setPendingAction(null) }} onConfirm={() => void runAction()} />}
+    {logsContainer && <ContainerLogsDialog container={logsContainer} onClose={() => setLogsContainer(null)} />}
+  </div>
+}
+
 function Dashboard({ account }: { account: { id: string; name: string } }) {
+  const [section, setSection] = useState<'workers' | 'servers'>('workers')
   const [workers, setWorkers] = useState<Worker[]>([])
   const [seatUsage, setSeatUsage] = useState<SeatUsage | null>(null)
   const [syncedAt, setSyncedAt] = useState<string | null>(null)
@@ -346,8 +735,9 @@ function Dashboard({ account }: { account: { id: string; name: string } }) {
         <div className="sidebar-top"><Logo /><button className="mobile-close" type="button" onClick={() => setMobileNav(false)} aria-label="Close navigation"><X size={19} /></button></div>
         <nav>
           <span className="nav-label">Workspace</span>
-          <a className="nav-link active" href="#workers"><LayoutGrid size={17} /> Workers <span>{workers.length}</span></a>
-          <a className="nav-link" href="#workers"><Users size={17} /> Access rules</a>
+          <button className={`nav-link nav-button ${section === 'workers' ? 'active' : ''}`} type="button" onClick={() => { setSection('workers'); setMobileNav(false) }}><LayoutGrid size={17} /> Workers <span>{workers.length}</span></button>
+          <button className={`nav-link nav-button ${section === 'servers' ? 'active' : ''}`} type="button" onClick={() => { setSection('servers'); setMobileNav(false) }}><Server size={17} /> Servers</button>
+          <button className="nav-link nav-button" type="button" onClick={() => { setSection('workers'); setFilter('all'); setMobileNav(false) }}><Users size={17} /> Access rules</button>
         </nav>
         <div className="sidebar-bottom">
           <div className="account-chip"><span className="avatar">{initials || 'CF'}</span><div><strong>{account.name}</strong><span>{account.id.slice(0, 10)}…</span></div><ChevronDown size={15} /></div>
@@ -356,14 +746,15 @@ function Dashboard({ account }: { account: { id: string; name: string } }) {
       </aside>
       {mobileNav && <button className="nav-backdrop" type="button" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
 
-      <section className="workspace" id="workers">
+      <section className="workspace" id={section}>
         <header className="topbar">
           <button className="mobile-menu" type="button" onClick={() => setMobileNav(true)} aria-label="Open navigation"><Menu size={20} /></button>
-          <div className="search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search Workers or emails" aria-label="Search Workers" /></div>
-          <div className="topbar-actions"><button className="secondary-button" type="button" disabled={loading} onClick={() => void loadWorkers()}><RefreshCw size={16} className={loading ? 'spin' : ''} /> Refresh</button></div>
+          {section === 'workers'
+            ? <><div className="search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search Workers or emails" aria-label="Search Workers" /></div><div className="topbar-actions"><button className="secondary-button" type="button" disabled={loading} onClick={() => void loadWorkers()}><RefreshCw size={16} className={loading ? 'spin' : ''} /> Refresh</button></div></>
+            : <div className="topbar-section"><Server size={16} /><span>Server operations</span></div>}
         </header>
 
-        <div className="content">
+        {section === 'workers' ? <div className="content">
           <div className="page-heading">
             <div><span className="eyebrow"><span /> Live inventory</span><h1>Workers</h1><p>Every service and its access boundary, in one place.</p></div>
             <div className="sync-pill"><span className="pulse" /> {syncedAt ? `Synced ${relativeDate(syncedAt)}` : 'Connecting'}</div>
@@ -415,7 +806,7 @@ function Dashboard({ account }: { account: { id: string; name: string } }) {
             ))}
             {!loading && filtered.length === 0 && !error && <div className="empty-state"><Search size={22} /><h2>No Workers found</h2><p>Try another search or access filter.</p></div>}
           </div>
-        </div>
+        </div> : <ServersDashboard />}
       </section>
       {selected && <AccessDialog worker={selected} onClose={() => setSelected(null)} onSaved={loadWorkers} />}
     </main>

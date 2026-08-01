@@ -1,8 +1,11 @@
 node_modules/
 dist/
+target/
 .wrangler/
 .dev.vars
 .env
+agent/config.toml
+agent/*.key
 .DS_Store
 *.log
 *.tsbuildinfo

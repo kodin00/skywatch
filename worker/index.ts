@@ -3,10 +3,45 @@ const SESSION_COOKIE = "skywatch_session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30;
 const ENCRYPTION_BINDING = "SKYWATCH_TOKEN_KEY";
 const TOKEN_AAD = new TextEncoder().encode("skywatch:cloudflare-api-token:v1");
+const AGENT_KEY_AAD = new TextEncoder().encode("skywatch:agent-hmac-key:v1");
+const AGENT_DEFAULT_ENDPOINT = "http://skywatch-agent.internal";
+const AGENT_MAX_RESPONSE_BYTES = 1024 * 1024;
+const AGENT_MAX_LOG_RESPONSE_BYTES = 1024 * 1024;
+const AGENT_READ_TIMEOUT_MS = 5_000;
+const AGENT_MUTATION_TIMEOUT_MS = 15_000;
+const AGENT_PAIR_TIMEOUT_MS = 5_000;
 
 type RuntimeEnv = Cloudflare.Env & {
   SKYWATCH_TOKEN_KEY?: CryptoKey;
+  VPS_AGENT?: Fetcher;
 };
+
+type AgentTransportName = "vpc" | "direct";
+type AgentRequestMethod = "GET" | "POST" | "DELETE";
+type AgentNode = { id: string; name: string; agentVersion: string };
+type StoredAgentConfiguration = {
+  transport: AgentTransportName;
+  endpoint: string;
+  allow_insecure_http: number;
+  node_id: string;
+  node_name: string;
+  agent_version: string;
+  key_id: string;
+  key_ciphertext: string;
+  key_iv: string;
+  connected_at: string;
+  updated_at: string;
+};
+type AgentConfigResponse = {
+  configured: boolean;
+  transport: AgentTransportName | null;
+  endpoint: string | null;
+  allowInsecureHttp: boolean;
+  node: AgentNode | null;
+  connectedAt: string | null;
+  updatedAt: string | null;
+};
+type AgentResponse<T> = { data: T; status: number };
 
 type ApiEnvelope<T> = {
   success: boolean;
@@ -126,6 +161,40 @@ export default {
         const workerId = decodeURIComponent(url.pathname.split("/")[3] ?? "");
         return withHeaders(await updateWorkerAccess(request, env, workerId));
       }
+      if (request.method === "GET" && url.pathname === "/api/agent/config") {
+        return withHeaders(await getAgentConfiguration(request, env));
+      }
+      if (request.method === "PUT" && url.pathname === "/api/agent/config") {
+        return withHeaders(await updateAgentConfiguration(request, env));
+      }
+      if (request.method === "DELETE" && url.pathname === "/api/agent/config") {
+        return withHeaders(await deleteAgentConfiguration(request, env));
+      }
+      if (request.method === "GET" && url.pathname === "/api/agent/health") {
+        return withHeaders(await proxyAgentRead(request, env, "/v1/health"));
+      }
+      if (request.method === "GET" && url.pathname === "/api/agent/system") {
+        return withHeaders(await proxyAgentRead(request, env, "/v1/system"));
+      }
+      if (request.method === "GET" && url.pathname === "/api/agent/containers") {
+        return withHeaders(await proxyAgentRead(request, env, "/v1/containers"));
+      }
+      const containerRoute = matchContainerRoute(url.pathname);
+      if (containerRoute && request.method === "GET" && containerRoute.operation === "inspect") {
+        return withHeaders(await proxyAgentRead(request, env, `/v1/containers/${encodeURIComponent(containerRoute.id)}`));
+      }
+      if (containerRoute && request.method === "GET" && containerRoute.operation === "logs") {
+        const tail = parseLogTail(url.searchParams.get("tail"));
+        return withHeaders(await proxyAgentRead(
+          request,
+          env,
+          `/v1/containers/${encodeURIComponent(containerRoute.id)}/logs?tail=${tail}`,
+          AGENT_MAX_LOG_RESPONSE_BYTES,
+        ));
+      }
+      if (containerRoute && request.method === "POST" && isContainerAction(containerRoute.operation)) {
+        return withHeaders(await proxyAgentMutation(request, env, containerRoute.id, containerRoute.operation));
+      }
 
       return withHeaders(json({ error: "Route not found", code: "not_found" }, 404));
     } catch (error) {
@@ -167,6 +236,33 @@ async function ensureSchema(db: D1Database): Promise<void> {
       nonce TEXT NOT NULL,
       created_at INTEGER NOT NULL
     )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS skywatch_agent_config (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      transport TEXT NOT NULL CHECK (transport IN ('vpc', 'direct')),
+      endpoint TEXT NOT NULL,
+      allow_insecure_http INTEGER NOT NULL DEFAULT 0 CHECK (allow_insecure_http IN (0, 1)),
+      node_id TEXT NOT NULL,
+      node_name TEXT NOT NULL,
+      agent_version TEXT NOT NULL,
+      key_id TEXT NOT NULL,
+      key_ciphertext TEXT NOT NULL,
+      key_iv TEXT NOT NULL,
+      connected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS skywatch_agent_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure')),
+      transport TEXT,
+      node_id TEXT,
+      container_id TEXT,
+      duration_ms INTEGER,
+      error_code TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_skywatch_agent_audit_created_at ON skywatch_agent_audit(created_at)"),
   ]);
 }
 
@@ -479,6 +575,829 @@ async function updateWorkerAccess(request: Request, env: RuntimeEnv, workerId: s
   return json({ accessStatus: "protected", emails });
 }
 
+interface AgentTransport {
+  readonly name: AgentTransportName;
+  fetch(request: Request): Promise<Response>;
+}
+
+class DirectAgentTransport implements AgentTransport {
+  readonly name = "direct" as const;
+
+  async fetch(request: Request): Promise<Response> {
+    return fetch(new Request(request, { redirect: "manual" }));
+  }
+}
+
+class VpcAgentTransport implements AgentTransport {
+  readonly name = "vpc" as const;
+
+  constructor(private readonly binding: Fetcher) {}
+
+  async fetch(request: Request): Promise<Response> {
+    return this.binding.fetch(request);
+  }
+}
+
+class AgentClient {
+  private constructor(
+    private readonly transport: AgentTransport,
+    private readonly endpoint: string,
+    private readonly node: AgentNode | null,
+    private readonly keyId: string,
+    private readonly key: CryptoKey,
+  ) {}
+
+  static async fromStored(env: RuntimeEnv, configuration: StoredAgentConfiguration): Promise<AgentClient> {
+    const keyBytes = await decryptAgentKey(env, configuration);
+    const key = await importHmacKey(keyBytes);
+    return new AgentClient(
+      createAgentTransport(env, configuration.transport),
+      configuration.endpoint,
+      storedAgentNode(configuration),
+      configuration.key_id,
+      key,
+    );
+  }
+
+  static async candidate(
+    transport: AgentTransport,
+    endpoint: string,
+    keyId: string,
+    rawKey: Uint8Array,
+  ): Promise<AgentClient> {
+    return new AgentClient(transport, endpoint, null, keyId, await importHmacKey(rawKey));
+  }
+
+  async request<T>(
+    pathAndQuery: string,
+    method: AgentRequestMethod,
+    body: unknown,
+    timeoutMs: number,
+    maxBytes = AGENT_MAX_RESPONSE_BYTES,
+  ): Promise<AgentResponse<T>> {
+    const requestId = crypto.randomUUID();
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const bodyBytes = body === undefined
+      ? new Uint8Array()
+      : new TextEncoder().encode(JSON.stringify(body));
+    const bodyDigest = await sha256Hex(bodyBytes);
+    const canonical = agentRequestCanonical(method, pathAndQuery, timestamp, requestId, bodyDigest);
+    const signature = await hmacBase64Url(this.key, canonical);
+    const headers = new Headers({
+      Accept: "application/json",
+      "X-Skywatch-Key-Id": this.keyId,
+      "X-Skywatch-Timestamp": timestamp,
+      "X-Skywatch-Nonce": requestId,
+      "X-Skywatch-Content-Sha256": bodyDigest,
+      "X-Skywatch-Signature": signature,
+    });
+    if (body !== undefined) headers.set("Content-Type", "application/json");
+
+    const { response, body: responseBytes } = await fetchAgentWithTimeout(
+      this.transport,
+      new Request(new URL(pathAndQuery, this.endpoint), {
+        method,
+        headers,
+        body: body === undefined ? undefined : bodyBytes,
+        cache: "no-store",
+        redirect: "manual",
+      }),
+      timeoutMs,
+      maxBytes,
+    );
+    await verifyAgentResponse(response, responseBytes, this.keyId, this.key, requestId);
+    const payload = parseAgentJson<T>(responseBytes);
+
+    if (!response.ok) throw mapAgentHttpError(response.status, payload);
+    if (pathAndQuery === "/v1/health" && this.node) assertAgentNodeIdentity(payload, this.node.id);
+    return { data: payload, status: response.status };
+  }
+}
+
+async function getAgentConfiguration(request: Request, env: RuntimeEnv): Promise<Response> {
+  await ensureSchema(env.DB);
+  await requireAuthentication(request, env.DB);
+  return json(agentConfigurationResponse(await readAgentConfiguration(env.DB)));
+}
+
+async function updateAgentConfiguration(request: Request, env: RuntimeEnv): Promise<Response> {
+  await ensureSchema(env.DB);
+  await requireAuthentication(request, env.DB);
+  const requestId = crypto.randomUUID();
+  const startedAt = Date.now();
+  const body = await readJson<{
+    transport?: unknown;
+    endpoint?: unknown;
+    pairingToken?: unknown;
+    allowInsecureHttp?: unknown;
+  }>(request);
+  let transport: AgentTransportName;
+  let endpoint: string;
+  const pairingToken = typeof body.pairingToken === "string" ? body.pairingToken.trim() : "";
+  try {
+    transport = parseAgentTransport(body.transport);
+    endpoint = validateAgentEndpoint(
+      transport,
+      body.endpoint,
+      body.allowInsecureHttp === true,
+    );
+    if (pairingToken.length > 512) {
+      throw new HttpError(400, "Enter the one-time pairing token shown by the agent.", "invalid_pairing_token");
+    }
+  } catch (error) {
+    await writeAgentAudit(
+      env.DB,
+      requestId,
+      "agent.config.switch",
+      "failure",
+      null,
+      null,
+      null,
+      Date.now() - startedAt,
+      agentErrorCode(error),
+    );
+    throw error;
+  }
+
+  try {
+    const wrappingKey = requireAgentWrappingKey(env);
+    const candidateTransport = createAgentTransport(env, transport);
+    const previous = await readAgentConfiguration(env.DB);
+    const credentials = pairingToken
+      ? parsePairingToken(pairingToken)
+      : previous
+        ? { keyId: previous.key_id, rawKey: await decryptAgentKey(env, previous) }
+        : null;
+    if (!credentials) {
+      throw new HttpError(400, "Enter the pairing token shown by the agent.", "invalid_pairing_token");
+    }
+    const { keyId, rawKey } = credentials;
+    const candidate = await AgentClient.candidate(candidateTransport, endpoint, keyId, rawKey);
+    const health = await candidate.request<unknown>(
+      "/v1/health",
+      "GET",
+      undefined,
+      AGENT_PAIR_TIMEOUT_MS,
+    );
+    const system = await candidate.request<unknown>(
+      "/v1/system",
+      "GET",
+      undefined,
+      AGENT_PAIR_TIMEOUT_MS,
+    );
+    const node = parseAgentNode(health.data, system.data);
+    if (previous && node.id !== previous.node_id) {
+      throw new HttpError(
+        409,
+        "That endpoint belongs to a different node. Delete the current connection before pairing another node.",
+        "node_identity_mismatch",
+      );
+    }
+    const encrypted = await encryptAgentKey(wrappingKey, rawKey);
+    const now = new Date().toISOString();
+    const allowInsecureHttp = transport === "direct"
+      && endpoint.startsWith("http://")
+      && body.allowInsecureHttp === true;
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO skywatch_agent_config
+        (id, transport, endpoint, allow_insecure_http, node_id, node_name, agent_version, key_id, key_ciphertext, key_iv, connected_at, updated_at)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          transport = excluded.transport,
+          endpoint = excluded.endpoint,
+          allow_insecure_http = excluded.allow_insecure_http,
+          node_id = excluded.node_id,
+          node_name = excluded.node_name,
+          agent_version = excluded.agent_version,
+          key_id = excluded.key_id,
+          key_ciphertext = excluded.key_ciphertext,
+          key_iv = excluded.key_iv,
+          connected_at = excluded.connected_at,
+          updated_at = excluded.updated_at`)
+        .bind(
+          transport,
+          endpoint,
+          allowInsecureHttp ? 1 : 0,
+          node.id,
+          node.name,
+          node.agentVersion,
+          keyId,
+          encrypted.ciphertext,
+          encrypted.iv,
+          now,
+          now,
+        ),
+      auditStatement(
+        env.DB,
+        requestId,
+        "agent.config.switch",
+        "success",
+        transport,
+        node.id,
+        null,
+        Date.now() - startedAt,
+        null,
+      ),
+      pruneAgentAuditStatement(env.DB),
+    ]);
+
+    return json(agentConfigurationResponse(await requireAgentConfiguration(env.DB)));
+  } catch (error) {
+    await writeAgentAudit(
+      env.DB,
+      requestId,
+      "agent.config.switch",
+      "failure",
+      transport,
+      null,
+      null,
+      Date.now() - startedAt,
+      agentErrorCode(error),
+    );
+    throw error;
+  }
+}
+
+async function deleteAgentConfiguration(request: Request, env: RuntimeEnv): Promise<Response> {
+  await ensureSchema(env.DB);
+  await requireAuthentication(request, env.DB);
+  const requestId = crypto.randomUUID();
+  const startedAt = Date.now();
+  const existing = await readAgentConfiguration(env.DB);
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM skywatch_agent_config WHERE id = 1"),
+    auditStatement(
+      env.DB,
+      requestId,
+      "agent.config.delete",
+      "success",
+      existing?.transport ?? null,
+      existing?.node_id ?? null,
+      null,
+      Date.now() - startedAt,
+      null,
+    ),
+    pruneAgentAuditStatement(env.DB),
+  ]);
+  return json(agentConfigurationResponse(null));
+}
+
+async function proxyAgentRead(
+  request: Request,
+  env: RuntimeEnv,
+  pathAndQuery: string,
+  maxBytes = AGENT_MAX_RESPONSE_BYTES,
+): Promise<Response> {
+  await ensureSchema(env.DB);
+  await requireAuthentication(request, env.DB);
+  const config = await requireAgentConfiguration(env.DB);
+  const client = await AgentClient.fromStored(env, config);
+  const response = await client.request<unknown>(pathAndQuery, "GET", undefined, AGENT_READ_TIMEOUT_MS, maxBytes);
+  return json(normalizeAgentPayload(pathAndQuery, response.data, config), response.status);
+}
+
+async function proxyAgentMutation(
+  request: Request,
+  env: RuntimeEnv,
+  containerId: string,
+  action: "start" | "stop" | "restart",
+): Promise<Response> {
+  await ensureSchema(env.DB);
+  await requireAuthentication(request, env.DB);
+  const config = await requireAgentConfiguration(env.DB);
+  const requestId = crypto.randomUUID();
+  const startedAt = Date.now();
+  try {
+    const client = await AgentClient.fromStored(env, config);
+    const response = await client.request<unknown>(
+      `/v1/containers/${encodeURIComponent(containerId)}/${action}`,
+      "POST",
+      undefined,
+      AGENT_MUTATION_TIMEOUT_MS,
+    );
+    await writeAgentAudit(
+      env.DB,
+      requestId,
+      `agent.container.${action}`,
+      "success",
+      config.transport,
+      config.node_id,
+      containerId,
+      Date.now() - startedAt,
+      null,
+    );
+    return json(normalizeAgentAction(response.data), response.status);
+  } catch (error) {
+    await writeAgentAudit(
+      env.DB,
+      requestId,
+      `agent.container.${action}`,
+      "failure",
+      config.transport,
+      config.node_id,
+      containerId,
+      Date.now() - startedAt,
+      agentErrorCode(error),
+    );
+    throw error;
+  }
+}
+
+function createAgentTransport(env: RuntimeEnv, transport: AgentTransportName): AgentTransport {
+  if (transport === "direct") return new DirectAgentTransport();
+  if (!env.VPS_AGENT) {
+    throw new HttpError(
+      503,
+      "The VPS_AGENT VPC Service binding is not attached to this Worker.",
+      "agent_transport_unavailable",
+    );
+  }
+  return new VpcAgentTransport(env.VPS_AGENT);
+}
+
+function parsePairingToken(value: string): { keyId: string; rawKey: Uint8Array } {
+  const separator = value.indexOf(".");
+  if (separator < 1 || value.indexOf(".", separator + 1) !== -1) {
+    throw new HttpError(400, "The agent pairing token has an invalid format.", "invalid_pairing_token");
+  }
+  const keyId = value.slice(0, separator);
+  const encodedKey = value.slice(separator + 1);
+  if (!isCanonicalUuid(keyId)
+    || !/^[A-Za-z0-9_-]{43}$/.test(encodedKey)) {
+    throw new HttpError(400, "The agent pairing token has an invalid format.", "invalid_pairing_token");
+  }
+  let rawKey: Uint8Array;
+  try {
+    rawKey = base64UrlToBytes(encodedKey);
+  } catch {
+    throw new HttpError(400, "The agent pairing token has an invalid key.", "invalid_pairing_token");
+  }
+  if (rawKey.byteLength !== 32) {
+    throw new HttpError(400, "The agent pairing key must be 32 bytes.", "invalid_pairing_token");
+  }
+  return { keyId, rawKey };
+}
+
+function isCanonicalUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+}
+
+async function fetchAgentWithTimeout(
+  transport: AgentTransport,
+  request: Request,
+  timeoutMs: number,
+  maxBytes: number,
+): Promise<{ response: Response; body: Uint8Array }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort("agent timeout"), timeoutMs);
+  const timedRequest = new Request(request, { signal: controller.signal });
+  try {
+    const response = await transport.fetch(timedRequest);
+    const body = await readLimitedBody(response, maxBytes);
+    return { response, body };
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+      throw new HttpError(504, "The VPS agent did not respond in time.", "agent_timeout");
+    }
+    console.warn({ event: "agent_unreachable", transport: transport.name, error: String(error) });
+    throw new HttpError(502, "Skywatch could not reach the VPS agent.", "agent_unreachable");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function verifyAgentResponse(
+  response: Response,
+  body: Uint8Array,
+  expectedKeyId: string,
+  key: CryptoKey,
+  expectedNonce: string,
+): Promise<void> {
+  const keyId = response.headers.get("X-Skywatch-Key-Id") ?? "";
+  const timestamp = response.headers.get("X-Skywatch-Timestamp") ?? "";
+  const nonce = response.headers.get("X-Skywatch-Nonce") ?? "";
+  const claimedDigest = response.headers.get("X-Skywatch-Content-Sha256") ?? "";
+  const signature = response.headers.get("X-Skywatch-Signature") ?? "";
+  if (keyId !== expectedKeyId || nonce !== expectedNonce || !/^\d{10}$/.test(timestamp)) {
+    throw new HttpError(502, "The VPS agent response could not be authenticated.", "agent_auth_failed");
+  }
+  const skew = Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp));
+  if (skew > 60) {
+    throw new HttpError(502, "The VPS agent response timestamp is outside the allowed window.", "agent_auth_failed");
+  }
+  const actualDigest = await sha256Hex(body);
+  if (!/^[a-f0-9]{64}$/.test(claimedDigest) || !(await timingSafeStringEqual(claimedDigest, actualDigest))) {
+    throw new HttpError(502, "The VPS agent response body failed integrity verification.", "agent_auth_failed");
+  }
+  if (!/^[A-Za-z0-9_-]{43}$/.test(signature)) {
+    throw new HttpError(502, "The VPS agent response signature is missing or invalid.", "agent_auth_failed");
+  }
+  const canonical = agentResponseCanonical(expectedNonce, response.status, timestamp, actualDigest);
+  const valid = await crypto.subtle.verify(
+    "HMAC",
+    key,
+    base64UrlToBytes(signature),
+    new TextEncoder().encode(canonical),
+  );
+  if (!valid) {
+    throw new HttpError(502, "The VPS agent response signature is invalid.", "agent_auth_failed");
+  }
+}
+
+function agentRequestCanonical(
+  method: AgentRequestMethod,
+  pathAndQuery: string,
+  timestamp: string,
+  nonce: string,
+  bodyDigest: string,
+): string {
+  return `skywatch-agent-v1\n${method}\n${pathAndQuery}\n${timestamp}\n${nonce}\n${bodyDigest}`;
+}
+
+function agentResponseCanonical(nonce: string, status: number, timestamp: string, bodyDigest: string): string {
+  return `skywatch-agent-response-v1\n${nonce}\n${status}\n${timestamp}\n${bodyDigest}`;
+}
+
+async function importHmacKey(rawKey: Uint8Array): Promise<CryptoKey> {
+  return crypto.subtle.importKey("raw", concreteBytes(rawKey), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+}
+
+async function hmacBase64Url(key: CryptoKey, value: string): Promise<string> {
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
+  return bytesToBase64Url(new Uint8Array(signature));
+}
+
+async function sha256Hex(value: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", concreteBytes(value)));
+  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function readLimitedBody(response: Response, maximum: number): Promise<Uint8Array> {
+  const declared = Number(response.headers.get("Content-Length") ?? "0");
+  if (Number.isFinite(declared) && declared > maximum) {
+    await response.body?.cancel();
+    throw new HttpError(502, "The VPS agent response was too large.", "agent_response_too_large");
+  }
+  if (!response.body) return new Uint8Array();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      length += next.value.byteLength;
+      if (length > maximum) {
+        await reader.cancel();
+        throw new HttpError(502, "The VPS agent response was too large.", "agent_response_too_large");
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const result = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+
+function parseAgentJson<T>(body: Uint8Array): T {
+  if (body.byteLength === 0) return {} as T;
+  try {
+    const value: unknown = JSON.parse(new TextDecoder().decode(body));
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("object required");
+    return value as T;
+  } catch {
+    throw new HttpError(502, "The VPS agent returned an invalid response.", "invalid_agent_response");
+  }
+}
+
+function mapAgentHttpError(status: number, payload: unknown): HttpError {
+  const object = isRecord(payload) ? payload : {};
+  const nestedError = isRecord(object.error) ? object.error : null;
+  const upstreamMessage = typeof object.error === "string" && object.error.length <= 240
+    ? object.error
+    : typeof nestedError?.message === "string" && nestedError.message.length <= 240
+      ? nestedError.message
+      : null;
+  if (status === 401 || status === 403) {
+    return new HttpError(502, "The VPS agent rejected Skywatch authentication.", "agent_auth_failed");
+  }
+  if (status === 404) {
+    return new HttpError(404, upstreamMessage ?? "The requested agent resource was not found.", "agent_resource_not_found");
+  }
+  if (status === 409) {
+    return new HttpError(409, upstreamMessage ?? "The VPS agent could not apply that operation.", "agent_conflict");
+  }
+  if (status === 429 || status === 503) {
+    return new HttpError(503, "The VPS agent is temporarily unavailable.", "agent_busy");
+  }
+  return new HttpError(502, "The VPS agent returned an unexpected error.", "agent_error");
+}
+
+function assertAgentNodeIdentity(payload: unknown, expectedNodeId: string): void {
+  if (!isRecord(payload) || payload.nodeId !== expectedNodeId) {
+    throw new HttpError(409, "The connected VPS agent identity changed. Pair it again.", "node_identity_mismatch");
+  }
+}
+
+function parseAgentNode(health: unknown, system: unknown): AgentNode {
+  if (!isRecord(health) || !isRecord(system)) {
+    throw new HttpError(502, "The VPS agent did not return its node identity.", "invalid_agent_response");
+  }
+  const id = typeof health.nodeId === "string" ? health.nodeId.trim() : "";
+  const name = typeof system.hostname === "string" ? system.hostname.trim() : "";
+  const agentVersion = typeof health.agentVersion === "string" ? health.agentVersion.trim() : "";
+  if (!isCanonicalUuid(id) || name.length < 1 || name.length > 128 || agentVersion.length < 1 || agentVersion.length > 64) {
+    throw new HttpError(502, "The VPS agent returned an invalid node identity.", "invalid_agent_response");
+  }
+  return { id, name, agentVersion };
+}
+
+function normalizeAgentPayload(pathAndQuery: string, payload: unknown, config: StoredAgentConfiguration): unknown {
+  if (!isRecord(payload)) {
+    throw new HttpError(502, "The VPS agent returned an invalid response.", "invalid_agent_response");
+  }
+  if (pathAndQuery === "/v1/health") {
+    const status = payload.status;
+    if (payload.apiVersion !== "v1"
+      || (status !== "ok" && status !== "degraded")
+      || typeof payload.dockerAvailable !== "boolean") {
+      throw new HttpError(502, "The VPS agent returned an invalid response.", "invalid_agent_response");
+    }
+    return {
+      status,
+      node: storedAgentNode(config),
+      agentVersion: stringValue(payload.agentVersion),
+      uptimeSeconds: typeof payload.uptimeSeconds === "number" ? numberValue(payload.uptimeSeconds) : 0,
+      dockerAvailable: payload.dockerAvailable,
+      collectedAt: stringValue(payload.sampledAt),
+    };
+  }
+  if (pathAndQuery === "/v1/system") return normalizeAgentSystem(payload, config);
+  if (pathAndQuery === "/v1/containers") {
+    return {
+      containers: arrayValue(payload.containers).map(normalizeContainerSummary),
+      collectedAt: typeof payload.collectedAt === "string"
+        ? payload.collectedAt
+        : stringValue(payload.sampledAt),
+    };
+  }
+  if (/\/logs\?tail=/.test(pathAndQuery)) {
+    const entries = arrayValue(payload.entries);
+    return {
+      containerId: stringValue(payload.containerId),
+      logs: typeof payload.logs === "string"
+        ? payload.logs
+        : entries.map((entry) => isRecord(entry) ? stringValue(entry.message) : "").join("\n"),
+      truncated: payload.truncated === true,
+      collectedAt: typeof payload.collectedAt === "string" ? payload.collectedAt : new Date().toISOString(),
+    };
+  }
+  if (/^\/v1\/containers\//.test(pathAndQuery)) {
+    return { container: normalizeContainerInspect(payload), collectedAt: new Date().toISOString() };
+  }
+  return payload;
+}
+
+function normalizeAgentSystem(payload: Record<string, unknown>, config: StoredAgentConfiguration): unknown {
+  const cpu = recordValue(payload.cpu);
+  const load = recordValue(cpu.loadAverage);
+  const memory = recordValue(payload.memory);
+  return {
+    node: storedAgentNode(config),
+    cpu: {
+      usagePercent: numberValue(cpu.usagePercent),
+      cores: numberValue(cpu.logicalCores),
+    },
+    memory: {
+      usedBytes: numberValue(memory.usedBytes),
+      totalBytes: numberValue(memory.totalBytes),
+    },
+    storage: arrayValue(payload.disks).map((disk) => {
+      const item = recordValue(disk);
+      const totalBytes = numberValue(item.totalBytes);
+      const availableBytes = numberValue(item.availableBytes);
+      return {
+        mount: stringValue(item.mountPoint),
+        usedBytes: Math.max(0, totalBytes - availableBytes),
+        totalBytes,
+      };
+    }),
+    load: {
+      one: numberValue(load.one),
+      five: numberValue(load.five),
+      fifteen: numberValue(load.fifteen),
+    },
+    uptimeSeconds: numberValue(payload.uptimeSeconds),
+    collectedAt: stringValue(payload.sampledAt),
+  };
+}
+
+function normalizeContainerSummary(value: unknown): Record<string, unknown> {
+  const item = recordValue(value);
+  return {
+    id: stringValue(item.id),
+    name: stringValue(item.name),
+    image: stringValue(item.image),
+    state: stringValue(item.state),
+    status: stringValue(item.status),
+    health: typeof item.health === "string" ? item.health : null,
+    createdAt: unixSecondsToIso(item.createdAt),
+    startedAt: null,
+    ports: normalizePortBindings(item.ports),
+    stats: item.stats ?? null,
+  };
+}
+
+function normalizeContainerInspect(value: unknown): Record<string, unknown> {
+  const item = recordValue(value);
+  return {
+    ...normalizeContainerSummary(item),
+    restartCount: numberValue(item.restartCount),
+    ports: normalizePortBindings(item.ports),
+  };
+}
+
+function normalizePortBindings(value: unknown): Array<Record<string, unknown>> {
+  if (value === undefined) return [];
+  return arrayValue(value).map((port) => {
+    const entry = recordValue(port);
+    return {
+      privatePort: numberValue(entry.privatePort),
+      publicPort: typeof entry.publicPort === "number" ? entry.publicPort : null,
+      type: typeof entry.type === "string" ? entry.type : stringValue(entry.protocol),
+      hostIp: typeof entry.hostIp === "string" ? entry.hostIp : null,
+    };
+  });
+}
+
+function normalizeAgentAction(value: unknown): unknown {
+  const payload = recordValue(value);
+  return {
+    action: stringValue(payload.action),
+    changed: payload.changed === true,
+    container: normalizeContainerSummary(payload.container),
+    completedAt: typeof payload.completedAt === "string" ? payload.completedAt : new Date().toISOString(),
+  };
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) throw new HttpError(502, "The VPS agent returned an invalid response.", "invalid_agent_response");
+  return value;
+}
+
+function arrayValue(value: unknown): unknown[] {
+  if (!Array.isArray(value)) throw new HttpError(502, "The VPS agent returned an invalid response.", "invalid_agent_response");
+  return value;
+}
+
+function stringValue(value: unknown): string {
+  if (typeof value !== "string") throw new HttpError(502, "The VPS agent returned an invalid response.", "invalid_agent_response");
+  return value;
+}
+
+function numberValue(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new HttpError(502, "The VPS agent returned an invalid response.", "invalid_agent_response");
+  }
+  return value;
+}
+
+function unixSecondsToIso(value: unknown): string | null {
+  if (value === null) return null;
+  const seconds = numberValue(value);
+  const date = new Date(seconds * 1000);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function parseAgentTransport(value: unknown): AgentTransportName {
+  if (value !== "vpc" && value !== "direct") {
+    throw new HttpError(400, "Choose VPC or direct transport.", "invalid_agent_config");
+  }
+  return value;
+}
+
+function validateAgentEndpoint(
+  transport: AgentTransportName,
+  value: unknown,
+  allowInsecureHttp: boolean,
+): string {
+  const supplied = typeof value === "string" ? value.trim() : "";
+  const candidate = supplied || (transport === "vpc" ? AGENT_DEFAULT_ENDPOINT : "");
+  let url: URL;
+  try {
+    url = new URL(candidate);
+  } catch {
+    throw new HttpError(400, "Enter a valid agent endpoint URL.", "invalid_agent_config");
+  }
+  if ((url.protocol !== "http:" && url.protocol !== "https:")
+    || url.username
+    || url.password
+    || (url.pathname !== "/" && url.pathname !== "")
+    || url.search
+    || url.hash) {
+    throw new HttpError(400, "The agent endpoint must be an HTTP(S) origin without credentials, a path, query, or fragment.", "invalid_agent_config");
+  }
+
+  if (transport === "direct") {
+    const hostname = stripIpv6Brackets(url.hostname).toLowerCase();
+    const literalIp = isIpv4Address(hostname) || isIpv6Address(hostname);
+    if (literalIp && !isPublicIpAddress(hostname)) {
+      throw new HttpError(400, "Direct transport requires a public IP address.", "invalid_agent_config");
+    }
+    if (!literalIp && (!isSafePublicHostname(hostname) || url.protocol !== "https:")) {
+      throw new HttpError(400, "Direct hostnames must be public and use HTTPS.", "invalid_agent_config");
+    }
+    if (url.protocol === "http:" && (!literalIp || !allowInsecureHttp)) {
+      throw new HttpError(
+        400,
+        "Plain HTTP is allowed only for an explicit public IP after acknowledging the insecure connection.",
+        "insecure_agent_url",
+      );
+    }
+  }
+
+  return url.origin;
+}
+
+function isSafePublicHostname(hostname: string): boolean {
+  return hostname.includes(".")
+    && hostname.length <= 253
+    && /^[a-z0-9.-]+$/.test(hostname)
+    && !hostname.endsWith(".")
+    && !hostname.endsWith(".local")
+    && !hostname.endsWith(".localhost")
+    && !hostname.endsWith(".internal");
+}
+
+function isIpv4Address(hostname: string): boolean {
+  const parts = hostname.split(".");
+  return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
+
+function isIpv6Address(hostname: string): boolean {
+  return hostname.includes(":") && /^[a-f0-9:]+$/i.test(hostname);
+}
+
+function isPublicIpAddress(hostname: string): boolean {
+  if (isIpv4Address(hostname)) {
+    const [a, b, c] = hostname.split(".").map(Number);
+    if (a === 0 || a === 10 || a === 127 || a >= 224) return false;
+    if (a === 100 && b >= 64 && b <= 127) return false;
+    if (a === 169 && b === 254) return false;
+    if (a === 172 && b >= 16 && b <= 31) return false;
+    if (a === 192 && (b === 0 || b === 168)) return false;
+    if (a === 192 && b === 0 && c === 2) return false;
+    if (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) return false;
+    if (a === 203 && b === 0 && c === 113) return false;
+    return true;
+  }
+  if (!isIpv6Address(hostname)) return false;
+  const first = Number.parseInt(hostname.split(":")[0] || "0", 16);
+  return first >= 0x2000 && first <= 0x3fff && !hostname.toLowerCase().startsWith("2001:db8:");
+}
+
+function stripIpv6Brackets(hostname: string): string {
+  return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+}
+
+function matchContainerRoute(pathname: string): { id: string; operation: "inspect" | "logs" | "start" | "stop" | "restart" } | null {
+  const match = /^\/api\/agent\/containers\/([^/]+)(?:\/(logs|start|stop|restart))?$/.exec(pathname);
+  if (!match) return null;
+  let id: string;
+  try {
+    id = decodeURIComponent(match[1]);
+  } catch {
+    throw new HttpError(400, "Container identifier is invalid.", "invalid_container_id");
+  }
+  if (!/^[a-f0-9]{64}$/.test(id)) {
+    throw new HttpError(400, "Container identifier is invalid.", "invalid_container_id");
+  }
+  return { id, operation: (match[2] ?? "inspect") as "inspect" | "logs" | "start" | "stop" | "restart" };
+}
+
+function isContainerAction(value: string): value is "start" | "stop" | "restart" {
+  return value === "start" || value === "stop" || value === "restart";
+}
+
+function parseLogTail(value: string | null): number {
+  if (value === null || value === "") return 200;
+  if (!/^\d{1,4}$/.test(value)) throw new HttpError(400, "Log tail must be between 1 and 1000.", "invalid_log_tail");
+  const tail = Number(value);
+  if (tail < 1 || tail > 1000) throw new HttpError(400, "Log tail must be between 1 and 1000.", "invalid_log_tail");
+  return tail;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 async function verifyApiToken(token: string): Promise<void> {
   const response = await fetch(`${API_ROOT}/user/tokens/verify`, {
     headers: { Authorization: `Bearer ${token}` },
@@ -783,6 +1702,142 @@ async function requireConfiguration(db: D1Database): Promise<StoredConfiguration
   return config;
 }
 
+async function readAgentConfiguration(db: D1Database): Promise<StoredAgentConfiguration | null> {
+  return db.prepare(`SELECT transport, endpoint, allow_insecure_http, node_id, node_name, agent_version, key_id,
+    key_ciphertext, key_iv, connected_at, updated_at
+    FROM skywatch_agent_config WHERE id = 1`).first<StoredAgentConfiguration>();
+}
+
+async function requireAgentConfiguration(db: D1Database): Promise<StoredAgentConfiguration> {
+  const configuration = await readAgentConfiguration(db);
+  if (!configuration) {
+    throw new HttpError(409, "Connect a VPS agent first.", "agent_not_configured");
+  }
+  return configuration;
+}
+
+function agentConfigurationResponse(configuration: StoredAgentConfiguration | null): AgentConfigResponse {
+  if (!configuration) {
+    return {
+      configured: false,
+      transport: null,
+      endpoint: null,
+      allowInsecureHttp: false,
+      node: null,
+      connectedAt: null,
+      updatedAt: null,
+    };
+  }
+  return {
+    configured: true,
+    transport: configuration.transport,
+    endpoint: configuration.endpoint,
+    allowInsecureHttp: configuration.allow_insecure_http === 1,
+    node: storedAgentNode(configuration),
+    connectedAt: configuration.connected_at,
+    updatedAt: configuration.updated_at,
+  };
+}
+
+function storedAgentNode(configuration: StoredAgentConfiguration): AgentNode {
+  return {
+    id: configuration.node_id,
+    name: configuration.node_name,
+    agentVersion: configuration.agent_version,
+  };
+}
+
+function requireAgentWrappingKey(env: RuntimeEnv): CryptoKey {
+  if (!env.SKYWATCH_TOKEN_KEY) {
+    throw new HttpError(503, "The encryption key is not available yet.", "setup_finalizing");
+  }
+  return env.SKYWATCH_TOKEN_KEY;
+}
+
+async function encryptAgentKey(
+  wrappingKey: CryptoKey,
+  rawKey: Uint8Array,
+): Promise<{ ciphertext: string; iv: string }> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const clear = Uint8Array.from(rawKey);
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData: AGENT_KEY_AAD },
+    wrappingKey,
+    clear,
+  );
+  return {
+    ciphertext: bytesToBase64(new Uint8Array(encrypted)),
+    iv: bytesToBase64(iv),
+  };
+}
+
+async function decryptAgentKey(env: RuntimeEnv, configuration: StoredAgentConfiguration): Promise<Uint8Array<ArrayBuffer>> {
+  const wrappingKey = requireAgentWrappingKey(env);
+  try {
+    const clear = await crypto.subtle.decrypt(
+      {
+        name: "AES-GCM",
+        iv: base64ToBytes(configuration.key_iv),
+        additionalData: AGENT_KEY_AAD,
+      },
+      wrappingKey,
+      base64ToBytes(configuration.key_ciphertext),
+    );
+    const result = new Uint8Array(clear);
+    if (result.byteLength !== 32) throw new Error("invalid key length");
+    return result;
+  } catch {
+    throw new HttpError(500, "The stored agent key could not be decrypted.", "agent_key_decryption_failed");
+  }
+}
+
+function auditStatement(
+  db: D1Database,
+  requestId: string,
+  action: string,
+  outcome: "success" | "failure",
+  transport: AgentTransportName | null,
+  nodeId: string | null,
+  containerId: string | null,
+  durationMs: number | null,
+  errorCode: string | null,
+): D1PreparedStatement {
+  return db.prepare(`INSERT INTO skywatch_agent_audit
+    (request_id, action, outcome, transport, node_id, container_id, duration_ms, error_code)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(requestId, action, outcome, transport, nodeId, containerId, durationMs, errorCode);
+}
+
+function pruneAgentAuditStatement(db: D1Database): D1PreparedStatement {
+  return db.prepare(`DELETE FROM skywatch_agent_audit
+    WHERE id NOT IN (SELECT id FROM skywatch_agent_audit ORDER BY id DESC LIMIT 1000)`);
+}
+
+async function writeAgentAudit(
+  db: D1Database,
+  requestId: string,
+  action: string,
+  outcome: "success" | "failure",
+  transport: AgentTransportName | null,
+  nodeId: string | null,
+  containerId: string | null,
+  durationMs: number | null,
+  errorCode: string | null,
+): Promise<void> {
+  try {
+    await db.batch([
+      auditStatement(db, requestId, action, outcome, transport, nodeId, containerId, durationMs, errorCode),
+      pruneAgentAuditStatement(db),
+    ]);
+  } catch (error) {
+    console.error({ event: "agent_audit_failed", requestId, error: String(error) });
+  }
+}
+
+function agentErrorCode(error: unknown): string {
+  return error instanceof HttpError ? error.code : "internal_error";
+}
+
 async function createSession(db: D1Database): Promise<string> {
   const token = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
   const hash = await sha256Base64(token);
@@ -913,8 +1968,13 @@ async function readJson<T>(request: Request): Promise<T> {
   const length = Number(request.headers.get("Content-Length") ?? "0");
   if (length > 16_384) throw new HttpError(413, "Request body is too large.", "body_too_large");
   try {
-    return await request.json<T>();
-  } catch {
+    const text = await request.text();
+    if (new TextEncoder().encode(text).byteLength > 16_384) {
+      throw new HttpError(413, "Request body is too large.", "body_too_large");
+    }
+    return JSON.parse(text) as T;
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
     throw new HttpError(400, "Request body is not valid JSON.", "invalid_json");
   }
 }
@@ -939,9 +1999,14 @@ async function timingSafeStringEqual(left: string, right: string): Promise<boole
   const rightBytes = new TextEncoder().encode(rightHash);
   if (leftBytes.byteLength !== rightBytes.byteLength) return false;
   const subtle = crypto.subtle as SubtleCrypto & {
-    timingSafeEqual(a: ArrayBufferView, b: ArrayBufferView): boolean;
+    timingSafeEqual?(a: ArrayBufferView, b: ArrayBufferView): boolean;
   };
-  return subtle.timingSafeEqual(leftBytes, rightBytes);
+  if (subtle.timingSafeEqual) return subtle.timingSafeEqual(leftBytes, rightBytes);
+  let difference = 0;
+  for (let index = 0; index < leftBytes.byteLength; index += 1) {
+    difference |= leftBytes[index] ^ rightBytes[index];
+  }
+  return difference === 0;
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -952,6 +2017,17 @@ function bytesToBase64(bytes: Uint8Array): string {
 
 function bytesToBase64Url(bytes: Uint8Array): string {
   return bytesToBase64(bytes).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+function base64UrlToBytes(value: string): Uint8Array<ArrayBuffer> {
+  const padding = "=".repeat((4 - value.length % 4) % 4);
+  return base64ToBytes(value.replaceAll("-", "+").replaceAll("_", "/") + padding);
+}
+
+function concreteBytes(value: Uint8Array): Uint8Array<ArrayBuffer> {
+  const result = new Uint8Array(new ArrayBuffer(value.byteLength));
+  result.set(value);
+  return result;
 }
 
 function base64ToBytes(value: string): Uint8Array<ArrayBuffer> {
@@ -984,3 +2060,39 @@ function withHeaders(response: Response): Response {
   headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
+
+export const __test = {
+  validateAgentEndpoint,
+  parsePairingToken,
+  parseAgentNode,
+  agentConfigurationResponse,
+  agentRequestCanonical,
+  agentResponseCanonical,
+  selectAgentTransport(transport: AgentTransportName, binding?: Fetcher): AgentTransportName {
+    return createAgentTransport({ VPS_AGENT: binding } as RuntimeEnv, transport).name;
+  },
+  async verifyAgentResponse(
+    response: Response,
+    body: Uint8Array,
+    expectedKeyId: string,
+    rawKey: Uint8Array,
+    expectedNonce: string,
+  ): Promise<void> {
+    return verifyAgentResponse(response, body, expectedKeyId, await importHmacKey(rawKey), expectedNonce);
+  },
+  async signResponse(
+    nonce: string,
+    status: number,
+    timestamp: string,
+    body: Uint8Array,
+    rawKey: Uint8Array,
+  ): Promise<{ digest: string; signature: string }> {
+    const digest = await sha256Hex(body);
+    const key = await importHmacKey(rawKey);
+    return {
+      digest,
+      signature: await hmacBase64Url(key, agentResponseCanonical(nonce, status, timestamp, digest)),
+    };
+  },
+  readLimitedBody,
+};
