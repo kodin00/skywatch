@@ -48,8 +48,10 @@ jobs:
           asset="skywatch-agent-${TARGET}.tar.gz"
           mkdir -p dist/package
           cp "${binary}" dist/package/skywatch-agent
+          cp agent/packaging/skywatch dist/package/skywatch
+          chmod 0755 dist/package/skywatch
           cp agent/packaging/systemd/skywatch-agent.service dist/package/skywatch-agent.service
-          tar -C dist/package -czf "dist/${asset}" skywatch-agent skywatch-agent.service
+          tar -C dist/package -czf "dist/${asset}" skywatch-agent skywatch skywatch-agent.service
           cd dist
           sha256sum "${asset}" > "${asset}.sha256"
 
@@ -96,4 +98,4 @@ jobs:
             --verify-tag \
             --latest \
             --title "Skywatch Agent ${version}" \
-            --notes "Static Linux binaries for x86_64 and arm64. Verify the downloaded archive with its adjacent SHA-256 file."
+            --notes "Static Linux binaries for x86_64 and arm64, including the skywatch management command. Verify the downloaded archive with its adjacent SHA-256 file."

@@ -5,7 +5,7 @@ set -Eeuo pipefail
 readonly REPOSITORY="kodin00/skywatch"
 readonly SOURCE_REF="${SKYWATCH_REF:-master}"
 readonly RUST_IMAGE="rust:1.97.1-alpine"
-readonly RELEASE_TAG="${SKYWATCH_AGENT_VERSION:-agent-v0.1.1}"
+readonly RELEASE_TAG="${SKYWATCH_AGENT_VERSION:-agent-v0.1.2}"
 readonly RELEASE_BASE="https://github.com/${REPOSITORY}/releases/download/${RELEASE_TAG}"
 readonly AGENT_USER="skywatch-agent"
 readonly AGENT_GROUP="skywatch-agent"
@@ -13,6 +13,7 @@ readonly INSTALL_ROOT="/etc/skywatch-agent"
 readonly CONFIG_PATH="${INSTALL_ROOT}/config.toml"
 readonly KEY_PATH="${INSTALL_ROOT}/controller.key"
 readonly BINARY_PATH="/usr/local/bin/skywatch-agent"
+readonly COMMAND_PATH="/usr/local/bin/skywatch"
 readonly UNIT_PATH="/etc/systemd/system/skywatch-agent.service"
 
 fail() {
@@ -64,6 +65,7 @@ esac
 
 binary_source=""
 unit_source=""
+command_source=""
 if [[ -n "${release_target}" ]]; then
   release_asset="skywatch-agent-${release_target}.tar.gz"
   release_archive="${work_directory}/${release_asset}"
@@ -81,6 +83,7 @@ if [[ -n "${release_target}" ]]; then
     tar -xzf "${release_archive}" -C "${release_directory}"
     binary_source="${release_directory}/skywatch-agent"
     unit_source="${release_directory}/skywatch-agent.service"
+    command_source="${release_directory}/skywatch"
   else
     printf 'No release binary is available yet; falling back to a pinned source build.\n'
   fi
@@ -107,10 +110,12 @@ if [[ -z "${binary_source}" ]]; then
 
   binary_source="${source_root}/agent/target/release/skywatch-agent"
   unit_source="${source_root}/agent/packaging/systemd/skywatch-agent.service"
+  command_source="${source_root}/agent/packaging/skywatch"
 fi
 
 [[ -x "${binary_source}" ]] || fail "installation source does not contain an executable agent binary"
 [[ -f "${unit_source}" ]] || fail "installation source does not contain the systemd unit"
+[[ -f "${command_source}" ]] || fail "installation source does not contain the management command"
 
 if ! getent group "${AGENT_GROUP}" >/dev/null 2>&1; then
   groupadd --system "${AGENT_GROUP}"
@@ -121,6 +126,7 @@ fi
 usermod --gid "${AGENT_GROUP}" --append --groups docker "${AGENT_USER}"
 
 install -m 0755 "${binary_source}" "${BINARY_PATH}"
+install -m 0755 "${command_source}" "${COMMAND_PATH}"
 install -d -o root -g "${AGENT_GROUP}" -m 0750 "${INSTALL_ROOT}"
 
 if [[ "${initialize_agent}" -eq 1 ]]; then
@@ -149,4 +155,4 @@ systemctl enable skywatch-agent.service >/dev/null
 systemctl restart skywatch-agent.service
 
 printf '\n%s\n' "${initialization_output}"
-printf '\nSkywatch agent is running. Check it with:\n  systemctl status skywatch-agent --no-pager\n'
+printf '\nSkywatch agent is running. Manage it with:\n  skywatch status\n  skywatch help\n'

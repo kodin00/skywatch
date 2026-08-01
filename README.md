@@ -77,6 +77,10 @@ curl -fsSL https://raw.githubusercontent.com/kodin00/skywatch/master/agent/insta
 
 The installer downloads a checksum-verified static binary from the current versioned GitHub Release, installs the hardened systemd service, and prints the pairing key needed by the Servers view. It binds to `127.0.0.1:8788` unless explicitly configured otherwise. If a release is temporarily unavailable, it falls back to a pinned Docker build.
 
+After installation, manage the service with `skywatch status`, `skywatch stop`,
+`skywatch restart`, `skywatch logs`, or `skywatch update`. Run `skywatch help` for the full,
+safety-checked command list, including uninstall and permanent deletion.
+
 - **Workers VPC Service:** private Worker-to-agent routing through `cloudflared`. The agent can remain on `127.0.0.1:8788`.
 - **Public Cloudflare Tunnel URL:** normal HTTPS `fetch()` through a public tunnel hostname to the same loopback listener.
 - **Public VPS IP over HTTP:** an explicit unsafe escape hatch. It requires opt-in on both the agent and dashboard and does not encrypt metrics, logs, or action metadata.

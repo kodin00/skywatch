@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+readonly REPOSITORY="kodin00/skywatch"
+readonly SERVICE="skywatch-agent.service"
+readonly BINARY_PATH="/usr/local/bin/skywatch-agent"
+readonly COMMAND_PATH="/usr/local/bin/skywatch"
+readonly UNIT_PATH="/etc/systemd/system/skywatch-agent.service"
+readonly INSTALL_ROOT="/etc/skywatch-agent"
+readonly CONFIG_PATH="${INSTALL_ROOT}/config.toml"
+readonly KEY_PATH="${INSTALL_ROOT}/controller.key"
+temporary_directory=""
+
+cleanup() {
+  if [[ -n "${temporary_directory}" && -d "${temporary_directory}" ]]; then
+    rm -rf -- "${temporary_directory}"
+  fi
+}
+trap cleanup EXIT
+
+fail() {
+  printf 'skywatch: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Skywatch VPS agent manager
+
+Usage: skywatch <command> [options]
+
+Commands:
+  status                 Show service status and installed version
+  start                  Start the agent
+  stop                   Stop the agent until the next start or reboot
+  restart                Restart the agent
+  enable                 Enable startup at boot and start the agent now
+  disable                Stop the agent and disable startup at boot
+  logs [LINES]           Show recent service logs (default: 100)
+  logs --follow          Follow service logs
+  version                Print the installed agent version
+  config                 Print the agent configuration (never the secret)
+  pairing-key            Print the dashboard pairing key (requires root)
+  update [agent-vX.Y.Z]  Install the latest or selected release safely
+  uninstall              Remove the service and commands, preserving config
+  delete [--yes]         Permanently remove the service, config, and identity
+  help                    Show this help
+
+Commands that change the service request sudo when not already root.
+EOF
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
+}
+
+as_root() {
+  if [[ "${EUID}" -eq 0 ]]; then
+    "$@"
+  else
+    require_command sudo
+    sudo "$@"
+  fi
+}
+
+validate_release_tag() {
+  [[ "$1" =~ ^agent-v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || fail "release must look like agent-v1.2.3"
+}
+
+installed_version() {
+  if [[ -x "${BINARY_PATH}" ]]; then
+    "${BINARY_PATH}" --version
+  else
+    printf 'skywatch-agent is not installed\n'
+    return 1
+  fi
+}
+
+service_action() {
+  require_command systemctl
+  as_root systemctl "$1" "${SERVICE}"
+}
+
+show_status() {
+  require_command systemctl
+  installed_version || true
+  printf 'Boot: %s\n' "$(systemctl is-enabled "${SERVICE}" 2>/dev/null || printf 'not installed')"
+  systemctl --no-pager --full status "${SERVICE}"
+}
+
+show_logs() {
+  require_command journalctl
+  local requested_lines="${1:-100}"
+  case "${requested_lines}" in
+    -f | --follow)
+      as_root journalctl --unit "${SERVICE}" --follow
+      ;;
+    *)
+      [[ "${requested_lines}" =~ ^[0-9]+$ ]] || fail "log line count must be a number or --follow"
+      requested_lines="$((10#${requested_lines}))"
+      (( requested_lines >= 1 && requested_lines <= 10000 )) || fail "log line count must be between 1 and 10000"
+      as_root journalctl --unit "${SERVICE}" --no-pager --lines "${requested_lines}"
+      ;;
+  esac
+}
+
+show_config() {
+  as_root test -f "${CONFIG_PATH}" || fail "configuration not found at ${CONFIG_PATH}"
+  as_root sed -n '1,240p' "${CONFIG_PATH}"
+}
+
+show_pairing_key() {
+  as_root test -f "${CONFIG_PATH}" || fail "configuration not found at ${CONFIG_PATH}"
+  as_root test -f "${KEY_PATH}" || fail "pairing key not found at ${KEY_PATH}"
+  local key_id secret
+  key_id="$(as_root sed -n 's/^[[:space:]]*key_id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${CONFIG_PATH}" | head -n 1)"
+  secret="$(as_root head -n 1 "${KEY_PATH}")"
+  [[ -n "${key_id}" && -n "${secret}" ]] || fail "could not read the pairing key"
+  printf '%s.%s\n' "${key_id}" "${secret}"
+  printf 'Keep this value secret; anyone holding it can authenticate to the agent.\n' >&2
+}
+
+resolve_latest_release() {
+  require_command curl
+  local latest_url
+  latest_url="$(curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+    --output /dev/null --write-out '%{url_effective}' \
+    "https://github.com/${REPOSITORY}/releases/latest")"
+  printf '%s\n' "${latest_url##*/}"
+}
+
+update_agent() {
+  require_command curl
+  require_command mktemp
+  local release_tag="${1:-}"
+  if [[ -z "${release_tag}" ]]; then
+    printf 'Checking the latest Skywatch agent release...\n'
+    release_tag="$(resolve_latest_release)"
+  fi
+  validate_release_tag "${release_tag}"
+
+  local installer
+  temporary_directory="$(mktemp -d)"
+  installer="${temporary_directory}/install.sh"
+  curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+    --retry 3 --output "${installer}" \
+    "https://raw.githubusercontent.com/${REPOSITORY}/${release_tag}/agent/install.sh"
+  printf 'Updating to %s...\n' "${release_tag}"
+  as_root env SKYWATCH_AGENT_VERSION="${release_tag}" bash "${installer}"
+  rm -rf -- "${temporary_directory}"
+  temporary_directory=""
+}
+
+confirm_delete() {
+  if [[ "${1:-}" == "--yes" ]]; then
+    return
+  fi
+  [[ -t 0 ]] || fail "delete requires an interactive terminal or the explicit --yes flag"
+  printf 'This permanently deletes the agent identity and pairing key. Type DELETE to continue: '
+  local answer
+  IFS= read -r answer
+  [[ "${answer}" == "DELETE" ]] || fail "delete cancelled"
+}
+
+remove_agent() {
+  local purge="$1"
+  require_command systemctl
+  if ! as_root systemctl disable --now "${SERVICE}"; then
+    printf 'skywatch: service was already stopped or not installed\n' >&2
+  fi
+  as_root rm -f -- "${UNIT_PATH}" "${BINARY_PATH}"
+  as_root systemctl daemon-reload
+
+  if [[ "${purge}" == "1" ]]; then
+    as_root rm -f -- "${CONFIG_PATH}" "${KEY_PATH}"
+    if ! as_root rmdir "${INSTALL_ROOT}" 2>/dev/null; then
+      printf 'skywatch: preserved non-Skywatch files under %s\n' "${INSTALL_ROOT}" >&2
+    fi
+    if id -u skywatch-agent >/dev/null 2>&1; then
+      as_root userdel skywatch-agent
+    fi
+    if getent group skywatch-agent >/dev/null 2>&1; then
+      as_root groupdel skywatch-agent || true
+    fi
+    printf 'Skywatch agent and pairing identity deleted.\n'
+  else
+    printf 'Skywatch agent removed; configuration preserved in %s.\n' "${INSTALL_ROOT}"
+  fi
+
+  as_root rm -f -- "${COMMAND_PATH}"
+}
+
+command="${1:-help}"
+shift || true
+
+case "${command}" in
+  help | -h | --help)
+    [[ "$#" -eq 0 ]] || fail "help does not accept arguments"
+    usage
+    ;;
+  status)
+    [[ "$#" -eq 0 ]] || fail "status does not accept arguments"
+    show_status
+    ;;
+  start | stop | restart)
+    [[ "$#" -eq 0 ]] || fail "${command} does not accept arguments"
+    service_action "${command}"
+    ;;
+  enable)
+    [[ "$#" -eq 0 ]] || fail "enable does not accept arguments"
+    require_command systemctl
+    as_root systemctl enable --now "${SERVICE}"
+    ;;
+  disable)
+    [[ "$#" -eq 0 ]] || fail "disable does not accept arguments"
+    require_command systemctl
+    as_root systemctl disable --now "${SERVICE}"
+    ;;
+  logs)
+    [[ "$#" -le 1 ]] || fail "logs accepts only a line count or --follow"
+    show_logs "${1:-100}"
+    ;;
+  version | --version)
+    [[ "$#" -eq 0 ]] || fail "version does not accept arguments"
+    installed_version
+    ;;
+  config)
+    [[ "$#" -eq 0 ]] || fail "config does not accept arguments"
+    show_config
+    ;;
+  pairing-key)
+    [[ "$#" -eq 0 ]] || fail "pairing-key does not accept arguments"
+    show_pairing_key
+    ;;
+  update)
+    [[ "$#" -le 1 ]] || fail "update accepts at most one release tag"
+    update_agent "${1:-}"
+    ;;
+  uninstall)
+    [[ "$#" -eq 0 ]] || fail "uninstall does not accept arguments; use delete to purge configuration"
+    remove_agent 0
+    ;;
+  delete)
+    [[ "$#" -le 1 ]] || fail "delete accepts only --yes"
+    [[ "$#" -eq 0 || "${1:-}" == "--yes" ]] || fail "delete accepts only --yes"
+    confirm_delete "${1:-}"
+    remove_agent 1
+    ;;
+  *)
+    usage >&2
+    fail "unknown command: ${command}"
+    ;;
+esac

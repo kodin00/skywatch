@@ -90,6 +90,8 @@ run = [
 description = "Format, lint, test, and release-build the VPS agent"
 dir = "agent"
 run = [
+  "bash -n install.sh packaging/skywatch",
+  "bash packaging/skywatch.test.sh",
   "cargo fmt --all -- --check",
   "cargo clippy --all-targets --all-features -- -D warnings",
   "cargo test --all-targets --all-features",

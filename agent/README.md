@@ -23,6 +23,26 @@ before piping it to a root shell if you have not audited this repository. Re-run
 installer updates the binary and systemd unit, restarts the service, and preserves the existing
 node UUID and pairing key.
 
+## Management command
+
+The installer adds a `skywatch` command for routine agent administration:
+
+    skywatch status
+    skywatch start
+    skywatch stop
+    skywatch restart
+    skywatch logs 200
+    skywatch logs --follow
+    skywatch update
+    skywatch config
+    skywatch pairing-key
+
+`skywatch disable` stops the service and prevents it from starting at boot; `skywatch enable`
+re-enables and starts it. `skywatch uninstall` removes the service and commands while preserving
+the node identity and pairing key for a later reinstall. `skywatch delete` permanently purges
+that state and requires typing `DELETE`; unattended deletion additionally requires `--yes`.
+Commands that mutate the installation request sudo automatically when needed.
+
 Release assets are built by [the agent release workflow](../.github/workflows/agent-release.yml)
 when an `agent-v*` tag is pushed. Unlike temporary Actions artifacts, they remain attached
 to the versioned GitHub Release along with their SHA-256 files.
