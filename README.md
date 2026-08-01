@@ -1,8 +1,18 @@
 # Skywatch
 
-Skywatch is a small, Cloudflare-native control plane for Workers and Cloudflare Access. It shows every Worker in an account, whether it is public or protected, the email selectors attached to its Access policies, and active Zero Trust seat usage. Access applications created by Skywatch can be switched between public and protected from the dashboard.
+Skywatch is a Cloudflare-native control plane for managing Workers, Access policies, and connected VPS infrastructure from one dashboard. It shows every Worker in an account, whether it is public or protected, the email selectors attached to its Access policies, and active Zero Trust seat usage. Access applications created by Skywatch can be switched between public and protected, while the optional VPS agent adds live host metrics and bounded Docker controls.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kodin00/skywatch)
+
+### Manage a VPS too
+
+After deploying Skywatch, install the optional agent on a Linux VPS with Docker and systemd:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kodin00/skywatch/master/agent/install.sh | sudo bash
+```
+
+The installer prints the pairing key needed by the Servers view. See [`agent/README.md`](./agent/README.md) for initialization, systemd installation, and transport-specific setup.
 
 ## What gets deployed
 
@@ -68,12 +78,6 @@ Run `mise run agent:dev` in a second terminal after generating a development age
 ## VPS agent
 
 The optional Rust agent in [`agent/`](./agent/) adds live host metrics and bounded Docker controls to the Servers view. Register multiple VPS nodes and switch between them from the server rack; only the selected node is polled. The browser never talks to an agent directly: Skywatch's Worker signs every request and uses that server's configured transport without automatic fallback.
-
-On a Linux VPS with Docker and systemd, install and start it with:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/kodin00/skywatch/master/agent/install.sh | sudo bash
-```
 
 The installer downloads a checksum-verified static binary from the current versioned GitHub Release, installs the hardened systemd service, and prints the pairing key needed by the Servers view. It binds to `127.0.0.1:8788` unless explicitly configured otherwise. If a release is temporarily unavailable, it falls back to a pinned Docker build.
 
