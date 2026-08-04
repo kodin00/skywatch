@@ -55,16 +55,7 @@ type Worker = {
   managedBySkywatch: boolean
 }
 
-type SeatUsage = {
-  available: boolean
-  used: number | null
-  limit: number | null
-  access: number | null
-  gateway: number | null
-  message?: string
-}
-
-type WorkersResponse = { workers: Worker[]; seatUsage: SeatUsage; syncedAt: string }
+type WorkersResponse = { workers: Worker[]; syncedAt: string }
 type ApiError = { error?: string; code?: string }
 
 type AgentTransport = 'vpc' | 'direct'
@@ -751,7 +742,6 @@ function ServersDashboard() {
 function Dashboard({ account }: { account: { id: string; name: string } }) {
   const [section, setSection] = useState<'workers' | 'servers'>('workers')
   const [workers, setWorkers] = useState<Worker[]>([])
-  const [seatUsage, setSeatUsage] = useState<SeatUsage | null>(null)
   const [syncedAt, setSyncedAt] = useState<string | null>(null)
   const [mobileNav, setMobileNav] = useState(false)
   const [filter, setFilter] = useState<'all' | AccessType>('all')
@@ -765,7 +755,6 @@ function Dashboard({ account }: { account: { id: string; name: string } }) {
     try {
       const result = await api<WorkersResponse>('/api/workers')
       setWorkers(result.workers)
-      setSeatUsage(result.seatUsage)
       setSyncedAt(result.syncedAt)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Workers could not be loaded.')
@@ -814,18 +803,6 @@ function Dashboard({ account }: { account: { id: string; name: string } }) {
           <div className="overview-strip">
             <div><span className="strip-label">Services</span><strong>{String(workers.length).padStart(2, '0')}</strong><small>deployed Workers</small></div>
             <div><span className="strip-label">Access boundary</span><strong>{String(protectedCount).padStart(2, '0')} <em>/ {String(workers.length).padStart(2, '0')}</em></strong><small>Workers protected</small></div>
-            <div className="seat-usage" title={seatUsage?.message}>
-              <span className="strip-label">User limit usage</span>
-              <strong>
-                {seatUsage?.available ? String(seatUsage.used ?? 0).padStart(2, '0') : '—'}
-                {seatUsage?.available && seatUsage.limit !== null && <em> / {seatUsage.limit}</em>}
-              </strong>
-              <small>{seatUsage?.available
-                ? seatUsage.limit === null
-                  ? `${seatUsage.access ?? 0} Access · ${seatUsage.gateway ?? 0} Gateway seats`
-                  : `${Math.max(0, seatUsage.limit - (seatUsage.used ?? 0))} seats remaining`
-                : seatUsage?.message ?? 'reading active seats'}</small>
-            </div>
             <div className="access-rail-legend" aria-label="Access distribution">
               {workers.slice(0, 8).map((worker) => <span key={worker.id} className={`${worker.accessStatus}-segment`} />)}
               {workers.length === 0 && <span className="public-segment" />}
