@@ -1,6 +1,7 @@
 mod api;
 mod auth;
 mod config;
+mod deployments;
 mod docker;
 mod metrics;
 mod models;
@@ -15,6 +16,7 @@ use crate::{
     api::{AppState, build_router},
     auth::Authenticator,
     config::{Config, initialize},
+    deployments::DeploymentStore,
     docker::{BollardDocker, DockerBackend},
     metrics::MetricsSampler,
 };
@@ -94,7 +96,8 @@ async fn serve(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         config.docker_timeout(),
         config.stats_concurrency,
     );
-    let state = AppState::new(config.clone(), authenticator, docker, metrics);
+    let deployments = DeploymentStore::load(&config.deployments_dir);
+    let state = AppState::new(config.clone(), authenticator, docker, metrics, deployments);
     let app = build_router(state);
     let listener = TcpListener::bind(config.listen).await?;
 

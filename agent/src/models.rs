@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -183,4 +183,97 @@ pub struct ErrorBody {
     pub code: &'static str,
     pub message: String,
     pub request_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeploymentState {
+    Running,
+    Success,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GithubBuildMode {
+    Docker,
+    Command,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeployRequest {
+    pub deployment_id: String,
+    pub name: String,
+    #[serde(flatten)]
+    pub source: DeploySource,
+    #[serde(default)]
+    pub env: String,
+    pub github_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "sourceType", content = "sourceConfig", rename_all = "lowercase")]
+pub enum DeploySource {
+    Compose(ComposeSource),
+    Github(GithubSource),
+    Image(ImageSource),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComposeSource {
+    pub compose: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GithubSource {
+    pub repo_url: String,
+    pub branch: Option<String>,
+    pub build_mode: GithubBuildMode,
+    pub dockerfile_path: Option<String>,
+    pub build_command: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageSource {
+    pub image: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeployAccepted {
+    pub deployment_id: String,
+    pub status: DeploymentState,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentStatus {
+    pub deployment_id: String,
+    pub name: String,
+    pub status: DeploymentState,
+    pub detail: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentsResponse {
+    pub deployments: Vec<DeploymentStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentResponse {
+    pub deployment: DeploymentStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OkResponse {
+    pub ok: bool,
 }

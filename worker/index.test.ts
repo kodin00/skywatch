@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { __test } from "./index";
+import worker, { __test } from "./index";
 
 const KEY_ID = "123e4567-e89b-42d3-a456-426614174000";
 const RAW_KEY = new Uint8Array(32);
@@ -196,5 +196,194 @@ describe("agent response normalization", () => {
       "c".repeat(64),
       "b".repeat(64),
     ]);
+  });
+});
+
+describe("project payload validation", () => {
+  it("rejects unknown source types", () => {
+    expect(thrownCode(() => __test.validateProjectPayload({
+      name: "app",
+      sourceType: "svn",
+      sourceConfig: {},
+    }))).toBe("invalid_source_type");
+  });
+
+  it("rejects github configs without a valid repo URL", () => {
+    for (const repoUrl of ["ftp://example.com/repo", "example.com/repo", ""]) {
+      expect(thrownCode(() => __test.validateProjectPayload({
+        name: "app",
+        sourceType: "github",
+        sourceConfig: { repoUrl, buildMode: "docker" },
+      }))).toBe("invalid_source_config");
+    }
+  });
+
+  it("requires a build command for command builds", () => {
+    expect(thrownCode(() => __test.validateProjectPayload({
+      name: "app",
+      sourceType: "github",
+      sourceConfig: { repoUrl: "https://github.com/example/repo", buildMode: "command" },
+    }))).toBe("invalid_source_config");
+    expect(thrownCode(() => __test.validateProjectPayload({
+      name: "app",
+      sourceType: "github",
+      sourceConfig: { repoUrl: "https://github.com/example/repo", buildMode: "command", buildCommand: "  " },
+    }))).toBe("invalid_source_config");
+  });
+
+  it("normalizes a valid github payload", () => {
+    const payload = __test.validateProjectPayload({
+      name: "  app  ",
+      sourceType: "github",
+      sourceConfig: {
+        repoUrl: "git@github.com:example/repo.git",
+        branch: "main",
+        buildMode: "command",
+        buildCommand: "make release",
+      },
+      env: "A=1",
+    });
+    expect(payload.name).toBe("app");
+    expect(payload.sourceConfig).toEqual({
+      repoUrl: "git@github.com:example/repo.git",
+      branch: "main",
+      buildMode: "command",
+      buildCommand: "make release",
+    });
+    expect(payload.env).toBe("A=1");
+  });
+
+  it("enforces per-type size limits and required content", () => {
+    expect(thrownCode(() => __test.validateProjectPayload({
+      name: "app",
+      sourceType: "image",
+      sourceConfig: { image: "x".repeat(513) },
+    }))).toBe("invalid_source_config");
+    expect(thrownCode(() => __test.validateProjectPayload({
+      name: "app",
+      sourceType: "compose",
+      sourceConfig: { compose: "   " },
+    }))).toBe("invalid_source_config");
+    expect(thrownCode(() => __test.validateProjectPayload({
+      name: "app",
+      sourceType: "script",
+      sourceConfig: { script: "" },
+    }))).toBe("invalid_source_config");
+    expect(thrownCode(() => __test.validateProjectPayload({
+      name: "app",
+      sourceType: "image",
+      sourceConfig: { image: "example/image:latest" },
+      env: "x".repeat(64 * 1024 + 1),
+    }))).toBe("invalid_env");
+  });
+});
+
+describe("worker name validation", () => {
+  it("accepts lowercase dashed names up to 63 characters", () => {
+    expect(__test.validateWorkerName("a")).toBe("a");
+    expect(__test.validateWorkerName("my-worker-1")).toBe("my-worker-1");
+    expect(__test.validateWorkerName("a".repeat(63))).toBe("a".repeat(63));
+  });
+
+  it("rejects malformed names", () => {
+    for (const name of ["", "-bad", "bad-", "Bad", "bad_name", "a".repeat(64), "bad..name"]) {
+      expect(thrownCode(() => __test.validateWorkerName(name))).toBe("invalid_worker_name");
+    }
+  });
+});
+
+describe("dotenv parsing", () => {
+  it("parses KEY=VALUE lines and skips comments and malformed lines", () => {
+    expect(__test.parseDotEnv([
+      "# a comment",
+      "",
+      "FOO=bar",
+      'QUOTED="hello world"',
+      "SINGLE='x y'",
+      "EMPTY=",
+      "NO_SEPARATOR",
+      "1BAD=skipped",
+      "SPACED = padded ",
+    ].join("\n"))).toEqual([
+      { name: "FOO", value: "bar" },
+      { name: "QUOTED", value: "hello world" },
+      { name: "SINGLE", value: "x y" },
+      { name: "EMPTY", value: "" },
+      { name: "SPACED", value: "padded" },
+    ]);
+  });
+
+  it("returns no bindings for empty content", () => {
+    expect(__test.parseDotEnv("")).toEqual([]);
+  });
+});
+
+describe("project and deployment route matching", () => {
+  it("matches project routes and validates UUID path params", () => {
+    expect(__test.matchProjectRoute(`/api/projects/${KEY_ID}`))
+      .toEqual({ projectId: KEY_ID, action: null });
+    expect(__test.matchProjectRoute(`/api/projects/${KEY_ID}/deploy`))
+      .toEqual({ projectId: KEY_ID, action: "deploy" });
+    expect(__test.matchProjectRoute("/api/projects")).toBeNull();
+    expect(__test.matchProjectRoute(`/api/projects/${KEY_ID}/unknown`)).toBeNull();
+    expect(thrownCode(() => __test.matchProjectRoute("/api/projects/not-a-uuid")))
+      .toBe("invalid_project_id");
+  });
+
+  it("matches deployment routes and validates UUID path params", () => {
+    expect(__test.matchDeploymentRoute(`/api/deployments/${KEY_ID}`))
+      .toEqual({ deploymentId: KEY_ID });
+    expect(__test.matchDeploymentRoute("/api/deployments")).toBeNull();
+    expect(thrownCode(() => __test.matchDeploymentRoute("/api/deployments/not-a-uuid")))
+      .toBe("invalid_deployment_id");
+  });
+});
+
+describe("project and deployment route 404s", () => {
+  const CONFIG_ROW = {
+    account_id: "account-1",
+    account_name: "Test Account",
+    token_ciphertext: "ciphertext",
+    token_iv: "iv",
+  };
+
+  function fakeDb(): D1Database {
+    const makeStatement = (sql: string) => {
+      const statement = {
+        bind: () => statement,
+        first: async () => (sql.includes("FROM skywatch_config") ? CONFIG_ROW : null),
+        all: async () => ({ results: [] }),
+        run: async () => ({ meta: { changes: 1 } }),
+      };
+      return statement;
+    };
+    return {
+      prepare: (sql: string) => makeStatement(sql),
+      batch: async () => [],
+    } as unknown as D1Database;
+  }
+
+  const env = { DB: fakeDb() } as unknown as Cloudflare.Env;
+
+  async function fetchCode(path: string): Promise<{ status: number; code: string | undefined }> {
+    const request = new Request(`https://skywatch.example${path}`) as unknown as Parameters<typeof worker.fetch>[0];
+    const response = await worker.fetch(request, env);
+    const body = await response.json() as { code?: string };
+    return { status: response.status, code: body.code };
+  }
+
+  it("returns project_not_found for unknown project ids", async () => {
+    expect(await fetchCode(`/api/projects/${KEY_ID}`))
+      .toEqual({ status: 404, code: "project_not_found" });
+  });
+
+  it("returns deployment_not_found for unknown deployment ids", async () => {
+    expect(await fetchCode(`/api/deployments/${KEY_ID}`))
+      .toEqual({ status: 404, code: "deployment_not_found" });
+  });
+
+  it("returns not_found for unknown api routes", async () => {
+    expect(await fetchCode("/api/definitely-not-a-route"))
+      .toEqual({ status: 404, code: "not_found" });
   });
 });

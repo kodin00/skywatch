@@ -1,9 +1,12 @@
 # Skywatch Agent
 
 The Skywatch agent is a deliberately narrow host-side service. It reports CPU, memory,
-storage, and Docker state and exposes only six Docker capabilities: list, inspect,
-finite logs, start, stop, and restart. It does not proxy the Docker API and has no shell,
-exec, image, volume, file, Compose, create, remove, or host-command endpoint.
+storage, and Docker state, exposes only six Docker capabilities (list, inspect,
+finite logs, start, stop, and restart), and runs project deployments on request:
+bring a Compose file, a GitHub repository, or an image reference and the agent
+materializes it with the local `git`, `docker`, and `docker compose` CLIs. It does
+not proxy the Docker API and has no shell, exec, image, volume, or host-command
+endpoint beyond those deployment flows.
 
 Docker socket access is effectively root access. The API boundary reduces what a remote
 controller can ask for, but it does not make membership in the docker group unprivileged.
@@ -174,6 +177,22 @@ sensitive and never included in structured logs.
 - POST /v1/containers/:canonical-64-hex-id/start
 - POST /v1/containers/:canonical-64-hex-id/stop
 - POST /v1/containers/:canonical-64-hex-id/restart
+- POST /v1/deployments
+- GET /v1/deployments
+- GET /v1/deployments/:uuid
+- DELETE /v1/deployments/:uuid
+
+POST /v1/deployments accepts `{ deploymentId, name, sourceType, sourceConfig, env, githubToken? }`
+with sourceType `compose` (a Compose YAML document), `github` (a repository clone plus a Docker
+build or a user build command), or `image` (a registry pull and run). It answers 202 immediately
+and runs the deploy in the background; poll GET /v1/deployments/:uuid for the status and the
+deploy log tail. Each deployment works in `<deployments_dir>/<deploymentId>/` (default: a
+`deployments` directory next to the config file) and persists a `state.json` record there so
+state survives agent restarts; deployments interrupted by a restart are marked failed. DELETE
+tears the deployment down (`docker compose down` or `docker rm -f` of the derived
+`skywatch-<slug>` container; command-built deployments manage their own processes) and
+removes the record and work directory. The GitHub token, when supplied, is used only for the
+clone and is never written to disk or logs.
 
 Responses contain normalized allowlisted fields. Raw inspect data, environment variables,
 labels, mount source paths, and daemon error text are never returned. Log snapshots default

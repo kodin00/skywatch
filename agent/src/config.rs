@@ -34,6 +34,10 @@ pub struct Config {
     pub log_tail_default: usize,
     pub log_tail_max: usize,
     pub log_bytes_max: usize,
+    /// Root directory for deployment work directories (`<deployments_dir>/<deploymentId>/`).
+    /// Relative paths resolve against the directory of the config file, so the
+    /// default is a `deployments` directory next to the config.
+    pub deployments_dir: PathBuf,
 }
 
 impl Default for Config {
@@ -57,6 +61,7 @@ impl Default for Config {
             log_tail_default: 200,
             log_tail_max: 1_000,
             log_bytes_max: 1_048_576,
+            deployments_dir: PathBuf::from("deployments"),
         }
     }
 }
@@ -91,6 +96,12 @@ impl Config {
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .join(&config.key_file);
+        }
+        if config.deployments_dir.is_relative() {
+            config.deployments_dir = path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&config.deployments_dir);
         }
         config.validate()?;
         Ok(config)
@@ -155,6 +166,11 @@ impl Config {
             || !(1_024..=8_388_608).contains(&self.log_bytes_max)
         {
             return Err(ConfigError::Invalid("log limits are invalid".into()));
+        }
+        if self.deployments_dir.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid(
+                "deployments_dir must not be empty".into(),
+            ));
         }
         Ok(())
     }
@@ -257,6 +273,7 @@ stats_concurrency = 4
 log_tail_default = 200
 log_tail_max = 1000
 log_bytes_max = 1048576
+deployments_dir = "deployments"
 "#,
         node_name = node_name,
         key_file = key_file.display().to_string(),

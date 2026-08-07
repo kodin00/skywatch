@@ -1,6 +1,6 @@
 # Skywatch
 
-Skywatch is a Cloudflare-native control plane for managing Workers, Access policies, and connected VPS infrastructure from one dashboard. It shows every Worker in an account, whether it is public or protected, the email selectors attached to its Access policies, and active Zero Trust seat usage. Access applications created by Skywatch can be switched between public and protected, while the optional VPS agent adds live host metrics and bounded Docker controls.
+Skywatch is a Cloudflare-native control plane for managing Workers, Access policies, and connected VPS infrastructure from one dashboard. It shows every Worker in an account, whether it is public or protected, the email selectors attached to its Access policies, and active Zero Trust seat usage. Access applications created by Skywatch can be switched between public and protected, while the optional VPS agent adds live host metrics, bounded Docker controls, and project deployments.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kodin00/skywatch)
 
@@ -13,6 +13,10 @@ curl -fsSL https://raw.githubusercontent.com/kodin00/skywatch/master/agent/insta
 ```
 
 The installer prints the pairing key needed by the Servers view. See [`agent/README.md`](./agent/README.md) for initialization, systemd installation, and transport-specific setup.
+
+### Deploy projects
+
+The Projects view turns Skywatch into a small deployment manager. A project points at a source — a Docker Compose file, a GitHub repository (HTTPS or SSH, cloned and built with `docker build` or a custom build command), a Docker image reference, or an inline Worker script — plus an optional `.env` edited as plain text or key/value pairs. Compose, GitHub, and image projects deploy to any paired VPS through the agent; Worker scripts deploy straight to Cloudflare through the API with the `.env` values attached as secret bindings. Environment contents and the optional GitHub token (used for private HTTPS clones, verified against the GitHub API on save) are encrypted with the same Worker-only key as the Cloudflare token, and every deployment is tracked with live status, logs, and one-click teardown.
 
 ## What gets deployed
 

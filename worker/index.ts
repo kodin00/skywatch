@@ -2,6 +2,9 @@ const API_ROOT = "https://api.cloudflare.com/client/v4";
 const ENCRYPTION_BINDING = "SKYWATCH_TOKEN_KEY";
 const TOKEN_AAD = new TextEncoder().encode("skywatch:cloudflare-api-token:v1");
 const AGENT_KEY_AAD = new TextEncoder().encode("skywatch:agent-hmac-key:v1");
+const GITHUB_TOKEN_AAD = new TextEncoder().encode("skywatch:github-token:v1");
+const PROJECT_ENV_AAD = new TextEncoder().encode("skywatch:project-env:v1");
+const PROJECT_BODY_MAX_BYTES = 2 * 1024 * 1024;
 const AGENT_DEFAULT_ENDPOINT = "http://skywatch-agent.internal";
 const AGENT_MAX_RESPONSE_BYTES = 1024 * 1024;
 const AGENT_MAX_LOG_RESPONSE_BYTES = 1024 * 1024;
@@ -116,6 +119,48 @@ type StoredConfiguration = {
   token_ciphertext: string;
   token_iv: string;
 };
+type ProjectSourceType = "compose" | "github" | "image" | "script";
+type DeploymentStatus = "pending" | "running" | "success" | "failed" | "removed";
+type DeploymentTargetType = "vps" | "cloudflare";
+type StoredProject = {
+  id: string;
+  name: string;
+  source_type: ProjectSourceType;
+  source_config: string;
+  env_ciphertext: string | null;
+  env_iv: string | null;
+  created_at: string;
+  updated_at: string;
+};
+type StoredDeployment = {
+  id: string;
+  project_id: string;
+  target_type: DeploymentTargetType;
+  target_server_id: string | null;
+  target_name: string | null;
+  status: DeploymentStatus;
+  detail: string | null;
+  created_at: string;
+  updated_at: string;
+};
+type StoredCredential = {
+  id: string;
+  label: string;
+  token_ciphertext: string;
+  token_iv: string;
+  created_at: string;
+  updated_at: string;
+};
+type StoredProjectSummaryRow = StoredProject & {
+  dep_id: string | null;
+  dep_target_type: DeploymentTargetType | null;
+  dep_target_server_id: string | null;
+  dep_target_name: string | null;
+  dep_status: DeploymentStatus | null;
+  dep_detail: string | null;
+  dep_created_at: string | null;
+  dep_updated_at: string | null;
+};
 
 class HttpError extends Error {
   constructor(
@@ -153,6 +198,41 @@ export default {
       if (request.method === "PUT" && /^\/api\/workers\/[^/]+\/access$/.test(url.pathname)) {
         const workerId = decodeURIComponent(url.pathname.split("/")[3] ?? "");
         return withHeaders(await updateWorkerAccess(request, env, workerId));
+      }
+      if (url.pathname === "/api/projects" && request.method === "GET") {
+        return withHeaders(await listProjects(env));
+      }
+      if (url.pathname === "/api/projects" && request.method === "POST") {
+        return withHeaders(await createProject(request, env));
+      }
+      const projectRoute = matchProjectRoute(url.pathname);
+      if (projectRoute && !projectRoute.action && request.method === "GET") {
+        return withHeaders(await getProject(env, projectRoute.projectId));
+      }
+      if (projectRoute && !projectRoute.action && request.method === "PUT") {
+        return withHeaders(await updateProject(request, env, projectRoute.projectId));
+      }
+      if (projectRoute && !projectRoute.action && request.method === "DELETE") {
+        return withHeaders(await deleteProject(env, projectRoute.projectId));
+      }
+      if (projectRoute?.action === "deploy" && request.method === "POST") {
+        return withHeaders(await deployProject(request, env, projectRoute.projectId));
+      }
+      const deploymentRoute = matchDeploymentRoute(url.pathname);
+      if (deploymentRoute && request.method === "GET") {
+        return withHeaders(await getDeployment(env, deploymentRoute.deploymentId));
+      }
+      if (deploymentRoute && request.method === "DELETE") {
+        return withHeaders(await deleteDeployment(env, deploymentRoute.deploymentId));
+      }
+      if (url.pathname === "/api/credentials/github" && request.method === "GET") {
+        return withHeaders(await getGithubCredential(env));
+      }
+      if (url.pathname === "/api/credentials/github" && request.method === "PUT") {
+        return withHeaders(await updateGithubCredential(request, env));
+      }
+      if (url.pathname === "/api/credentials/github" && request.method === "DELETE") {
+        return withHeaders(await deleteGithubCredential(env));
       }
       if (url.pathname === "/api/servers" && request.method === "GET") {
         return withHeaders(await listAgentConfigurations(env));
@@ -282,6 +362,36 @@ async function ensureSchema(db: D1Database): Promise<void> {
       WHERE id = 1
         AND NOT EXISTS (SELECT 1 FROM skywatch_agent_migrations WHERE id = 1)`),
     db.prepare("INSERT OR IGNORE INTO skywatch_agent_migrations (id) VALUES (1)"),
+    db.prepare(`CREATE TABLE IF NOT EXISTS skywatch_credentials (
+      id TEXT PRIMARY KEY,
+      label TEXT NOT NULL DEFAULT '',
+      token_ciphertext TEXT NOT NULL,
+      token_iv TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS skywatch_projects (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      source_type TEXT NOT NULL CHECK (source_type IN ('compose', 'github', 'image', 'script')),
+      source_config TEXT NOT NULL,
+      env_ciphertext TEXT,
+      env_iv TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS skywatch_deployments (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES skywatch_projects(id) ON DELETE CASCADE,
+      target_type TEXT NOT NULL CHECK (target_type IN ('vps', 'cloudflare')),
+      target_server_id TEXT,
+      target_name TEXT,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'success', 'failed', 'removed')),
+      detail TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_skywatch_deployments_project ON skywatch_deployments(project_id, created_at DESC)"),
   ]);
 }
 
@@ -1986,6 +2096,684 @@ function inferWorkerName(url: URL): string {
   return firstLabel;
 }
 
+type ProjectRoute = { projectId: string; action: "deploy" | null };
+
+function matchProjectRoute(pathname: string): ProjectRoute | null {
+  const segments = pathname.split("/").filter(Boolean);
+  if (segments[0] !== "api" || segments[1] !== "projects" || segments.length < 3 || segments.length > 4) {
+    return null;
+  }
+  let projectId: string;
+  try {
+    projectId = decodeURIComponent(segments[2]);
+  } catch {
+    throw new HttpError(400, "Project identifier is invalid.", "invalid_project_id");
+  }
+  if (!isCanonicalUuid(projectId)) {
+    throw new HttpError(400, "Project identifier is invalid.", "invalid_project_id");
+  }
+  if (segments.length === 3) return { projectId, action: null };
+  if (segments[3] === "deploy") return { projectId, action: "deploy" };
+  return null;
+}
+
+function matchDeploymentRoute(pathname: string): { deploymentId: string } | null {
+  const segments = pathname.split("/").filter(Boolean);
+  if (segments[0] !== "api" || segments[1] !== "deployments" || segments.length !== 3) return null;
+  let deploymentId: string;
+  try {
+    deploymentId = decodeURIComponent(segments[2]);
+  } catch {
+    throw new HttpError(400, "Deployment identifier is invalid.", "invalid_deployment_id");
+  }
+  if (!isCanonicalUuid(deploymentId)) {
+    throw new HttpError(400, "Deployment identifier is invalid.", "invalid_deployment_id");
+  }
+  return { deploymentId };
+}
+
+type ValidatedProjectPayload = {
+  name: string;
+  sourceType: ProjectSourceType;
+  sourceConfig: Record<string, unknown>;
+  env: string | null;
+};
+
+function validateProjectPayload(body: unknown): ValidatedProjectPayload {
+  const record = isRecord(body) ? body : {};
+  const name = typeof record.name === "string" ? record.name.trim() : "";
+  if (name.length < 1 || name.length > 80) {
+    throw new HttpError(400, "Project names must be 1-80 characters.", "invalid_project");
+  }
+  const sourceType = record.sourceType;
+  if (sourceType !== "compose" && sourceType !== "github" && sourceType !== "image" && sourceType !== "script") {
+    throw new HttpError(400, "Choose a valid project source type.", "invalid_source_type");
+  }
+  const sourceConfig = validateSourceConfig(sourceType, record.sourceConfig);
+  let env: string | null = null;
+  if (record.env !== undefined && record.env !== null) {
+    if (typeof record.env !== "string" || byteLength(record.env) > 64 * 1024) {
+      throw new HttpError(400, "Environment content must be text of at most 64 KB.", "invalid_env");
+    }
+    env = record.env.length ? record.env : null;
+  }
+  return { name, sourceType, sourceConfig, env };
+}
+
+function validateSourceConfig(sourceType: ProjectSourceType, value: unknown): Record<string, unknown> {
+  const config = isRecord(value) ? value : {};
+  if (sourceType === "compose") {
+    const compose = typeof config.compose === "string" ? config.compose : "";
+    if (!compose.trim() || byteLength(compose) > 256 * 1024) {
+      throw new HttpError(400, "Compose projects need a compose file of at most 256 KB.", "invalid_source_config");
+    }
+    return { compose };
+  }
+  if (sourceType === "github") {
+    const repoUrl = typeof config.repoUrl === "string" ? config.repoUrl.trim() : "";
+    if (!/^(https:\/\/|git@|ssh:\/\/)/.test(repoUrl)) {
+      throw new HttpError(400, "Enter a valid Git repository URL.", "invalid_source_config");
+    }
+    const buildMode = config.buildMode;
+    if (buildMode !== "docker" && buildMode !== "command") {
+      throw new HttpError(400, "Choose a docker or command build mode.", "invalid_source_config");
+    }
+    const branch = typeof config.branch === "string" && config.branch.trim() ? config.branch.trim() : undefined;
+    const result: Record<string, unknown> = { repoUrl, buildMode };
+    if (branch) result.branch = branch;
+    if (buildMode === "docker") {
+      const dockerfilePath = typeof config.dockerfilePath === "string" && config.dockerfilePath.trim()
+        ? config.dockerfilePath.trim()
+        : undefined;
+      if (dockerfilePath) result.dockerfilePath = dockerfilePath;
+    } else {
+      const buildCommand = typeof config.buildCommand === "string" ? config.buildCommand.trim() : "";
+      if (!buildCommand) {
+        throw new HttpError(400, "Command builds need a build command.", "invalid_source_config");
+      }
+      result.buildCommand = buildCommand;
+    }
+    return result;
+  }
+  if (sourceType === "image") {
+    const image = typeof config.image === "string" ? config.image.trim() : "";
+    if (!image || image.length > 512) {
+      throw new HttpError(400, "Image projects need an image reference of at most 512 characters.", "invalid_source_config");
+    }
+    return { image };
+  }
+  const script = typeof config.script === "string" ? config.script : "";
+  if (!script.trim() || byteLength(script) > 1024 * 1024) {
+    throw new HttpError(400, "Script projects need a Worker module of at most 1 MB.", "invalid_source_config");
+  }
+  return { script };
+}
+
+function validateWorkerName(value: unknown): string {
+  const workerName = typeof value === "string" ? value.trim() : "";
+  if (!/^[a-z0-9](-?[a-z0-9]){0,62}$/.test(workerName)) {
+    throw new HttpError(400, "Enter a valid Worker name (lowercase letters, digits, dashes).", "invalid_worker_name");
+  }
+  return workerName;
+}
+
+function parseDotEnv(content: string): Array<{ name: string; value: string }> {
+  const entries: Array<{ name: string; value: string }> = [];
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const separator = line.indexOf("=");
+    if (separator < 1) continue;
+    const name = line.slice(0, separator).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
+    let value = line.slice(separator + 1).trim();
+    if (value.length >= 2
+      && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) {
+      value = value.slice(1, -1);
+    }
+    entries.push({ name, value });
+  }
+  return entries;
+}
+
+function byteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+async function readProject(db: D1Database, projectId: string): Promise<StoredProject | null> {
+  return db.prepare(`SELECT id, name, source_type, source_config, env_ciphertext, env_iv, created_at, updated_at
+    FROM skywatch_projects WHERE id = ? LIMIT 1`).bind(projectId).first<StoredProject>();
+}
+
+async function requireProject(db: D1Database, projectId: string): Promise<StoredProject> {
+  const project = await readProject(db, projectId);
+  if (!project) throw new HttpError(404, "That project was not found.", "project_not_found");
+  return project;
+}
+
+async function readDeployment(db: D1Database, deploymentId: string): Promise<StoredDeployment | null> {
+  return db.prepare(`SELECT id, project_id, target_type, target_server_id, target_name, status, detail, created_at, updated_at
+    FROM skywatch_deployments WHERE id = ? LIMIT 1`).bind(deploymentId).first<StoredDeployment>();
+}
+
+async function requireDeployment(db: D1Database, deploymentId: string): Promise<StoredDeployment> {
+  const deployment = await readDeployment(db, deploymentId);
+  if (!deployment) throw new HttpError(404, "That deployment was not found.", "deployment_not_found");
+  return deployment;
+}
+
+async function updateDeploymentStatus(
+  db: D1Database,
+  deploymentId: string,
+  status: DeploymentStatus,
+  detail: string | null,
+): Promise<StoredDeployment> {
+  await db.prepare(`UPDATE skywatch_deployments
+    SET status = ?, detail = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?`).bind(status, detail, deploymentId).run();
+  return requireDeployment(db, deploymentId);
+}
+
+async function readCredential(db: D1Database, id: string): Promise<StoredCredential | null> {
+  return db.prepare(`SELECT id, label, token_ciphertext, token_iv, created_at, updated_at
+    FROM skywatch_credentials WHERE id = ? LIMIT 1`).bind(id).first<StoredCredential>();
+}
+
+function deploymentResponse(deployment: StoredDeployment) {
+  return {
+    id: deployment.id,
+    projectId: deployment.project_id,
+    targetType: deployment.target_type,
+    targetServerId: deployment.target_server_id,
+    targetName: deployment.target_name,
+    status: deployment.status,
+    detail: deployment.detail,
+    createdAt: deployment.created_at,
+    updatedAt: deployment.updated_at,
+  };
+}
+
+function projectSummaryResponse(project: StoredProject, latestDeployment: StoredDeployment | null) {
+  return {
+    id: project.id,
+    name: project.name,
+    sourceType: project.source_type,
+    sourceConfig: JSON.parse(project.source_config),
+    hasEnv: project.env_ciphertext !== null,
+    createdAt: project.created_at,
+    updatedAt: project.updated_at,
+    latestDeployment: latestDeployment ? deploymentResponse(latestDeployment) : null,
+  };
+}
+
+function latestDeploymentFromRow(row: StoredProjectSummaryRow): StoredDeployment | null {
+  if (!row.dep_id) return null;
+  return {
+    id: row.dep_id,
+    project_id: row.id,
+    target_type: row.dep_target_type ?? "vps",
+    target_server_id: row.dep_target_server_id,
+    target_name: row.dep_target_name,
+    status: row.dep_status ?? "pending",
+    detail: row.dep_detail,
+    created_at: row.dep_created_at ?? row.created_at,
+    updated_at: row.dep_updated_at ?? row.updated_at,
+  };
+}
+
+async function encryptSecret(
+  env: RuntimeEnv,
+  aad: Uint8Array,
+  value: string,
+): Promise<{ ciphertext: string; iv: string }> {
+  const key = env.SKYWATCH_TOKEN_KEY;
+  if (!key) {
+    throw new HttpError(503, "The encryption key is still being attached. Retry in a few seconds.", "setup_finalizing");
+  }
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData: concreteBytes(aad) },
+    key,
+    new TextEncoder().encode(value),
+  );
+  return {
+    ciphertext: bytesToBase64(new Uint8Array(encrypted)),
+    iv: bytesToBase64(iv),
+  };
+}
+
+async function decryptSecret(
+  env: RuntimeEnv,
+  aad: Uint8Array,
+  ciphertext: string,
+  iv: string,
+  errorCode: string,
+): Promise<string> {
+  const key = env.SKYWATCH_TOKEN_KEY;
+  if (!key) {
+    throw new HttpError(503, "The encryption key is still being attached. Retry in a few seconds.", "setup_finalizing");
+  }
+  try {
+    const clear = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: base64ToBytes(iv), additionalData: concreteBytes(aad) },
+      key,
+      base64ToBytes(ciphertext),
+    );
+    return new TextDecoder().decode(clear);
+  } catch {
+    throw new HttpError(500, "The stored secret could not be decrypted.", errorCode);
+  }
+}
+
+async function decryptProjectEnv(env: RuntimeEnv, project: StoredProject): Promise<string> {
+  if (project.env_ciphertext === null || project.env_iv === null) return "";
+  return decryptSecret(env, PROJECT_ENV_AAD, project.env_ciphertext, project.env_iv, "env_decryption_failed");
+}
+
+async function readGithubToken(env: RuntimeEnv): Promise<string | null> {
+  const credential = await readCredential(env.DB, "github");
+  if (!credential) return null;
+  return decryptSecret(
+    env,
+    GITHUB_TOKEN_AAD,
+    credential.token_ciphertext,
+    credential.token_iv,
+    "github_token_decryption_failed",
+  );
+}
+
+async function listProjects(env: RuntimeEnv): Promise<Response> {
+  await ensureSchema(env.DB);
+  await requireConfiguration(env.DB);
+  const result = await env.DB.prepare(`SELECT
+    p.id, p.name, p.source_type, p.source_config, p.env_ciphertext, p.env_iv, p.created_at, p.updated_at,
+    d.id AS dep_id, d.target_type AS dep_target_type, d.target_server_id AS dep_target_server_id,
+    d.target_name AS dep_target_name, d.status AS dep_status, d.detail AS dep_detail,
+    d.created_at AS dep_created_at, d.updated_at AS dep_updated_at
+    FROM skywatch_projects p
+    LEFT JOIN skywatch_deployments d ON d.id = (
+      SELECT id FROM skywatch_deployments WHERE project_id = p.id ORDER BY created_at DESC, id DESC LIMIT 1
+    )
+    ORDER BY p.created_at DESC, p.id DESC`).all<StoredProjectSummaryRow>();
+  return json({
+    projects: result.results.map((row) => projectSummaryResponse(row, latestDeploymentFromRow(row))),
+  });
+}
+
+async function createProject(request: Request, env: RuntimeEnv): Promise<Response> {
+  await ensureSchema(env.DB);
+  await requireConfiguration(env.DB);
+  const payload = validateProjectPayload(await readJson(request, PROJECT_BODY_MAX_BYTES));
+  const id = crypto.randomUUID();
+  const encryptedEnv = payload.env === null ? null : await encryptSecret(env, PROJECT_ENV_AAD, payload.env);
+  await env.DB.prepare(`INSERT INTO skywatch_projects
+    (id, name, source_type, source_config, env_ciphertext, env_iv)
+    VALUES (?, ?, ?, ?, ?, ?)`)
+    .bind(
+      id,
+      payload.name,
+      payload.sourceType,
+      JSON.stringify(payload.sourceConfig),
+      encryptedEnv?.ciphertext ?? null,
+      encryptedEnv?.iv ?? null,
+    )
+    .run();
+  return json({ project: projectSummaryResponse(await requireProject(env.DB, id), null) }, 201);
+}
+
+async function getProject(env: RuntimeEnv, projectId: string): Promise<Response> {
+  await ensureSchema(env.DB);
+  await requireConfiguration(env.DB);
+  const project = await requireProject(env.DB, projectId);
+  const deployments = await env.DB.prepare(`SELECT id, project_id, target_type, target_server_id, target_name, status, detail, created_at, updated_at
+    FROM skywatch_deployments WHERE project_id = ? ORDER BY created_at DESC, id DESC LIMIT 20`)
+    .bind(projectId)
+    .all<StoredDeployment>();
+  const latest = deployments.results[0] ?? null;
+  return json({
+    project: {
+      ...projectSummaryResponse(project, latest),
+      env: await decryptProjectEnv(env, project),
+      deployments: deployments.results.map(deploymentResponse),
+    },
+  });
+}
+
+async function updateProject(request: Request, env: RuntimeEnv, projectId: string): Promise<Response> {
+  await ensureSchema(env.DB);
+  await requireConfiguration(env.DB);
+  await requireProject(env.DB, projectId);
+  const payload = validateProjectPayload(await readJson(request, PROJECT_BODY_MAX_BYTES));
+  const encryptedEnv = payload.env === null ? null : await encryptSecret(env, PROJECT_ENV_AAD, payload.env);
+  await env.DB.prepare(`UPDATE skywatch_projects
+    SET name = ?, source_type = ?, source_config = ?, env_ciphertext = ?, env_iv = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?`)
+    .bind(
+      payload.name,
+      payload.sourceType,
+      JSON.stringify(payload.sourceConfig),
+      encryptedEnv?.ciphertext ?? null,
+      encryptedEnv?.iv ?? null,
+      projectId,
+    )
+    .run();
+  const project = await requireProject(env.DB, projectId);
+  const latest = await env.DB.prepare(`SELECT id, project_id, target_type, target_server_id, target_name, status, detail, created_at, updated_at
+    FROM skywatch_deployments WHERE project_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`)
+    .bind(projectId)
+    .first<StoredDeployment>();
+  return json({ project: projectSummaryResponse(project, latest) });
+}
+
+async function deleteProject(env: RuntimeEnv, projectId: string): Promise<Response> {
+  await ensureSchema(env.DB);
+  await requireConfiguration(env.DB);
+  await requireProject(env.DB, projectId);
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM skywatch_deployments WHERE project_id = ?").bind(projectId),
+    env.DB.prepare("DELETE FROM skywatch_projects WHERE id = ?").bind(projectId),
+  ]);
+  return json({ ok: true });
+}
+
+async function deployProject(request: Request, env: RuntimeEnv, projectId: string): Promise<Response> {
+  await ensureSchema(env.DB);
+  const config = await requireConfiguration(env.DB);
+  const project = await requireProject(env.DB, projectId);
+  const body = await readJson<{ targetType?: unknown; serverId?: unknown; workerName?: unknown }>(request);
+  if (body.targetType !== "vps" && body.targetType !== "cloudflare") {
+    throw new HttpError(400, "Choose a vps or cloudflare deployment target.", "invalid_target");
+  }
+  return body.targetType === "vps"
+    ? deployProjectToVps(env, project, body.serverId)
+    : deployProjectToCloudflare(env, config, project, body.workerName);
+}
+
+async function deployProjectToVps(
+  env: RuntimeEnv,
+  project: StoredProject,
+  serverIdValue?: unknown,
+): Promise<Response> {
+  if (project.source_type === "script") {
+    throw new HttpError(400, "Script projects can only deploy to Cloudflare Workers.", "invalid_target");
+  }
+  const serverId = typeof serverIdValue === "string" ? serverIdValue.trim() : "";
+  if (!isCanonicalUuid(serverId)) {
+    throw new HttpError(400, "Server identifier is invalid.", "invalid_server_id");
+  }
+  const server = await readAgentConfiguration(env.DB, serverId);
+  if (!server) {
+    throw new HttpError(404, "That registered server was not found.", "server_not_found");
+  }
+
+  const deploymentId = crypto.randomUUID();
+  await env.DB.prepare(`INSERT INTO skywatch_deployments
+    (id, project_id, target_type, target_server_id, target_name, status)
+    VALUES (?, ?, 'vps', ?, NULL, 'running')`)
+    .bind(deploymentId, project.id, serverId)
+    .run();
+
+  const requestId = crypto.randomUUID();
+  const startedAt = Date.now();
+  try {
+    const client = await AgentClient.fromStored(env, server);
+    const payload: Record<string, unknown> = {
+      deploymentId,
+      name: project.name,
+      sourceType: project.source_type,
+      sourceConfig: JSON.parse(project.source_config),
+      env: await decryptProjectEnv(env, project),
+    };
+    if (project.source_type === "github") {
+      const githubToken = await readGithubToken(env);
+      if (githubToken) payload.githubToken = githubToken;
+    }
+    await client.request<unknown>("/v1/deployments", "POST", payload, AGENT_MUTATION_TIMEOUT_MS);
+    await writeAgentAudit(
+      env.DB,
+      requestId,
+      "agent.deployment.create",
+      "success",
+      server.transport,
+      server.node_id,
+      deploymentId,
+      Date.now() - startedAt,
+      null,
+    );
+  } catch (error) {
+    const detail = error instanceof Error ? error.message.slice(0, 500) : "Deployment request failed.";
+    await updateDeploymentStatus(env.DB, deploymentId, "failed", detail);
+    await writeAgentAudit(
+      env.DB,
+      requestId,
+      "agent.deployment.create",
+      "failure",
+      server.transport,
+      server.node_id,
+      deploymentId,
+      Date.now() - startedAt,
+      agentErrorCode(error),
+    );
+  }
+
+  return json({ deployment: deploymentResponse(await requireDeployment(env.DB, deploymentId)) }, 202);
+}
+
+async function deployProjectToCloudflare(
+  env: RuntimeEnv,
+  config: StoredConfiguration,
+  project: StoredProject,
+  workerNameValue: unknown,
+): Promise<Response> {
+  if (project.source_type !== "script") {
+    throw new HttpError(400, "Only script projects can deploy to Cloudflare Workers.", "invalid_target");
+  }
+  const workerName = validateWorkerName(workerNameValue);
+
+  const deploymentId = crypto.randomUUID();
+  await env.DB.prepare(`INSERT INTO skywatch_deployments
+    (id, project_id, target_type, target_server_id, target_name, status)
+    VALUES (?, ?, 'cloudflare', NULL, ?, 'running')`)
+    .bind(deploymentId, project.id, workerName)
+    .run();
+
+  try {
+    const token = await decryptStoredToken(env);
+    const sourceConfig = JSON.parse(project.source_config) as { script?: unknown };
+    const script = typeof sourceConfig.script === "string" ? sourceConfig.script : "";
+    await deployWorkerScript(token, config.account_id, workerName, script, await decryptProjectEnv(env, project));
+    await updateDeploymentStatus(env.DB, deploymentId, "success", null);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message.slice(0, 500) : "Cloudflare deployment failed.";
+    await updateDeploymentStatus(env.DB, deploymentId, "failed", detail);
+  }
+
+  return json({ deployment: deploymentResponse(await requireDeployment(env.DB, deploymentId)) }, 202);
+}
+
+async function deployWorkerScript(
+  token: string,
+  accountId: string,
+  workerName: string,
+  script: string,
+  dotenv: string,
+): Promise<void> {
+  const bindings = parseDotEnv(dotenv).map(({ name, value }) => ({ type: "secret_text", name, text: value }));
+  const metadata = {
+    main_module: `${workerName}.mjs`,
+    compatibility_date: new Date().toISOString().slice(0, 10),
+    bindings,
+  };
+  const form = new FormData();
+  form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata");
+  form.append(
+    `${workerName}.mjs`,
+    new Blob([script], { type: "application/javascript+module" }),
+    `${workerName}.mjs`,
+  );
+  const response = await fetch(
+    `${API_ROOT}/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}`,
+    {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token}` },
+      body: form,
+    },
+  );
+  const data = await parseEnvelope<unknown>(response);
+  if (!response.ok || !data.success) {
+    const message = data.errors?.map((error) => error.message).filter(Boolean).join(" ")
+      || `Cloudflare API returned ${response.status}.`;
+    throw new HttpError(502, message, "cloudflare_api_error");
+  }
+}
+
+async function getDeployment(env: RuntimeEnv, deploymentId: string): Promise<Response> {
+  await ensureSchema(env.DB);
+  await requireConfiguration(env.DB);
+  let deployment = await requireDeployment(env.DB, deploymentId);
+  if (deployment.target_type === "vps"
+    && (deployment.status === "pending" || deployment.status === "running")
+    && deployment.target_server_id) {
+    const server = await readAgentConfiguration(env.DB, deployment.target_server_id);
+    if (server) {
+      try {
+        const client = await AgentClient.fromStored(env, server);
+        const response = await client.request<{ deployment?: unknown }>(
+          `/v1/deployments/${encodeURIComponent(deploymentId)}`,
+          "GET",
+          undefined,
+          AGENT_READ_TIMEOUT_MS,
+        );
+        const agentDeployment = isRecord(response.data) && isRecord(response.data.deployment)
+          ? response.data.deployment
+          : null;
+        if (agentDeployment) {
+          const status = agentDeployment.status === "success" || agentDeployment.status === "failed"
+            ? agentDeployment.status
+            : "running";
+          const detail = typeof agentDeployment.detail === "string" ? agentDeployment.detail.slice(0, 500) : null;
+          if (status !== deployment.status || detail !== deployment.detail) {
+            deployment = await updateDeploymentStatus(env.DB, deploymentId, status, detail);
+          }
+        }
+      } catch (error) {
+        if (error instanceof HttpError && error.status === 404) {
+          deployment = await updateDeploymentStatus(
+            env.DB,
+            deploymentId,
+            "failed",
+            "Agent no longer tracks this deployment",
+          );
+        } else {
+          console.warn({ event: "deployment_status_unavailable", deploymentId, error: String(error) });
+        }
+      }
+    }
+  }
+  return json({ deployment: deploymentResponse(deployment) });
+}
+
+async function deleteDeployment(env: RuntimeEnv, deploymentId: string): Promise<Response> {
+  await ensureSchema(env.DB);
+  await requireConfiguration(env.DB);
+  const deployment = await requireDeployment(env.DB, deploymentId);
+  if (deployment.target_type === "vps" && deployment.status !== "removed" && deployment.target_server_id) {
+    const server = await readAgentConfiguration(env.DB, deployment.target_server_id);
+    if (server) {
+      const requestId = crypto.randomUUID();
+      const startedAt = Date.now();
+      try {
+        const client = await AgentClient.fromStored(env, server);
+        await client.request<unknown>(
+          `/v1/deployments/${encodeURIComponent(deploymentId)}`,
+          "DELETE",
+          undefined,
+          AGENT_MUTATION_TIMEOUT_MS,
+        );
+        await writeAgentAudit(
+          env.DB,
+          requestId,
+          "agent.deployment.delete",
+          "success",
+          server.transport,
+          server.node_id,
+          deploymentId,
+          Date.now() - startedAt,
+          null,
+        );
+      } catch (error) {
+        console.warn({ event: "agent_deployment_delete_failed", deploymentId, error: String(error) });
+        await writeAgentAudit(
+          env.DB,
+          requestId,
+          "agent.deployment.delete",
+          "failure",
+          server.transport,
+          server.node_id,
+          deploymentId,
+          Date.now() - startedAt,
+          agentErrorCode(error),
+        );
+      }
+    }
+  }
+  await updateDeploymentStatus(env.DB, deploymentId, "removed", deployment.detail);
+  return json({ ok: true });
+}
+
+async function getGithubCredential(env: RuntimeEnv): Promise<Response> {
+  await ensureSchema(env.DB);
+  await requireConfiguration(env.DB);
+  const credential = await readCredential(env.DB, "github");
+  return json({
+    configured: Boolean(credential),
+    label: credential?.label || null,
+    updatedAt: credential?.updated_at ?? null,
+  });
+}
+
+async function updateGithubCredential(request: Request, env: RuntimeEnv): Promise<Response> {
+  await ensureSchema(env.DB);
+  await requireConfiguration(env.DB);
+  const body = await readJson<{ token?: unknown }>(request);
+  const token = typeof body.token === "string" ? body.token.trim() : "";
+  if (token.length < 20 || token.length > 255) {
+    throw new HttpError(400, "Enter a valid GitHub token.", "invalid_github_token");
+  }
+  const response = await fetch("https://api.github.com/user", {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "skywatch",
+    },
+  });
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new HttpError(400, "GitHub rejected this token.", "invalid_github_token");
+  }
+  const profile: unknown = await response.json().catch(() => null);
+  const label = isRecord(profile) && typeof profile.login === "string" ? profile.login : "";
+  const encrypted = await encryptSecret(env, GITHUB_TOKEN_AAD, token);
+  await env.DB.prepare(`INSERT INTO skywatch_credentials (id, label, token_ciphertext, token_iv)
+    VALUES ('github', ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      label = excluded.label,
+      token_ciphertext = excluded.token_ciphertext,
+      token_iv = excluded.token_iv,
+      updated_at = CURRENT_TIMESTAMP`)
+    .bind(label, encrypted.ciphertext, encrypted.iv)
+    .run();
+  const credential = await readCredential(env.DB, "github");
+  return json({ configured: true, label: label || null, updatedAt: credential?.updated_at ?? null });
+}
+
+async function deleteGithubCredential(env: RuntimeEnv): Promise<Response> {
+  await ensureSchema(env.DB);
+  await requireConfiguration(env.DB);
+  await env.DB.prepare("DELETE FROM skywatch_credentials WHERE id = 'github'").run();
+  return json({ configured: false });
+}
+
 function assertSameOrigin(request: Request): void {
   const origin = request.headers.get("Origin");
   if (origin && origin !== new URL(request.url).origin) {
@@ -1993,15 +2781,15 @@ function assertSameOrigin(request: Request): void {
   }
 }
 
-async function readJson<T>(request: Request): Promise<T> {
+async function readJson<T>(request: Request, maxBytes = 16_384): Promise<T> {
   if (!request.headers.get("Content-Type")?.toLowerCase().includes("application/json")) {
     throw new HttpError(415, "Send this request as JSON.", "invalid_content_type");
   }
   const length = Number(request.headers.get("Content-Length") ?? "0");
-  if (length > 16_384) throw new HttpError(413, "Request body is too large.", "body_too_large");
+  if (length > maxBytes) throw new HttpError(413, "Request body is too large.", "body_too_large");
   try {
     const text = await request.text();
-    if (new TextEncoder().encode(text).byteLength > 16_384) {
+    if (new TextEncoder().encode(text).byteLength > maxBytes) {
       throw new HttpError(413, "Request body is too large.", "body_too_large");
     }
     return JSON.parse(text) as T;
@@ -2091,6 +2879,14 @@ export const __test = {
   normalizeAgentPayload,
   agentConfigurationResponse,
   matchServerRoute,
+  matchProjectRoute,
+  matchDeploymentRoute,
+  validateProjectPayload,
+  validateSourceConfig,
+  validateWorkerName,
+  parseDotEnv,
+  projectSummaryResponse,
+  deploymentResponse,
   agentRequestCanonical,
   agentResponseCanonical,
   selectAgentTransport(transport: AgentTransportName, binding?: Fetcher): AgentTransportName {

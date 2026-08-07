@@ -5,9 +5,13 @@ import {
   ArrowRight,
   Box,
   Check,
+  ChevronDown,
+  ChevronUp,
   Cloud,
   Cpu,
   Database,
+  FolderGit2,
+  GitBranch,
   Globe2,
   HardDrive,
   KeyRound,
@@ -16,9 +20,11 @@ import {
   MemoryStick,
   Menu,
   MoreHorizontal,
+  Pencil,
   Play,
   Plus,
   RefreshCw,
+  Rocket,
   RotateCw,
   Search,
   Server,
@@ -99,6 +105,33 @@ type AgentContainer = {
 }
 type ContainersResponse = { containers: AgentContainer[]; collectedAt: string }
 type AgentAction = 'start' | 'stop' | 'restart'
+
+type SourceType = 'compose' | 'github' | 'image' | 'script'
+type DeploymentStatus = 'pending' | 'running' | 'success' | 'failed' | 'removed'
+type Deployment = {
+  id: string
+  projectId: string
+  targetType: 'vps' | 'cloudflare'
+  targetServerId: string | null
+  targetName: string | null
+  status: DeploymentStatus
+  detail: string | null
+  createdAt: string
+  updatedAt: string
+}
+type ProjectSummary = {
+  id: string
+  name: string
+  sourceType: SourceType
+  sourceConfig: Record<string, unknown>
+  hasEnv: boolean
+  createdAt: string
+  updatedAt: string
+  latestDeployment: Deployment | null
+}
+type ProjectDetail = ProjectSummary & { env: string; deployments: Deployment[] }
+type ProjectsResponse = { projects: ProjectSummary[] }
+type GitHubCredential = { configured: boolean; label: string | null; updatedAt: string | null }
 
 const setupTasks = [
   { label: 'Prepare encrypted D1 vault', icon: Database },
@@ -332,6 +365,67 @@ function isInsecureHttpEndpoint(endpoint: string): boolean {
   } catch {
     return endpoint.trim().toLowerCase().startsWith('http:')
   }
+}
+
+export type EnvRow = { key: string; value: string }
+
+export function parseEnv(text: string): EnvRow[] {
+  return text.split('\n').flatMap((line) => {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) return []
+    const index = line.indexOf('=')
+    if (index < 0) return []
+    const key = line.slice(0, index).trim()
+    if (!key) return []
+    return [{ key, value: line.slice(index + 1).trim() }]
+  })
+}
+
+export function serializeEnv(rows: EnvRow[]): string {
+  return rows
+    .filter((row) => row.key.trim())
+    .map((row) => `${row.key.trim()}=${row.value}`)
+    .join('\n')
+}
+
+const WORKER_NAME_RE = /^[a-z0-9](-?[a-z0-9]){0,62}$/
+
+export function slugifyWorkerName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 63)
+    .replace(/-+$/, '')
+}
+
+const sourceTypeLabels: Record<SourceType, string> = {
+  compose: 'Compose',
+  github: 'GitHub',
+  image: 'Image',
+  script: 'Worker script',
+}
+
+function projectSourceSummary(project: ProjectSummary): string {
+  const config = project.sourceConfig
+  if (project.sourceType === 'github') {
+    const repo = typeof config.repoUrl === 'string' && config.repoUrl ? config.repoUrl : 'repository'
+    const branch = typeof config.branch === 'string' && config.branch ? `#${config.branch}` : ''
+    return `${repo}${branch}`
+  }
+  if (project.sourceType === 'image') return typeof config.image === 'string' && config.image ? config.image : 'image'
+  if (project.sourceType === 'compose') return 'compose.yaml'
+  return 'worker script'
+}
+
+function deploymentTargetLabel(deployment: Deployment, servers: AgentConfig[]): string {
+  if (deployment.targetType === 'cloudflare') return `worker:${deployment.targetName ?? 'unnamed'}`
+  const server = deployment.targetServerId ? servers.find((item) => item.id === deployment.targetServerId) : null
+  return server?.node.name ?? deployment.targetName ?? deployment.targetServerId ?? 'unknown server'
+}
+
+function DeploymentStatusPill({ status }: { status: DeploymentStatus }) {
+  return <span className={`state-badge ${status}`}>{status}</span>
 }
 
 function AccessDialog({ worker, onClose, onSaved }: { worker: Worker; onClose: () => void; onSaved: () => Promise<void> }) {
@@ -739,8 +833,491 @@ function ServersDashboard() {
   </div>
 }
 
+function ConfirmDialog({ eyebrow, title, description, confirmLabel, busy, error, onClose, onConfirm }: {
+  eyebrow: string
+  title: string
+  description: string
+  confirmLabel: string
+  busy: boolean
+  error: string
+  onClose: () => void
+  onConfirm: () => void
+}) {
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (!busy && event.target === event.currentTarget) onClose() }}>
+    <section className="access-dialog action-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-dialog-title" aria-describedby="confirm-dialog-description">
+      <header><div><span className="eyebrow"><span /> {eyebrow}</span><h2 id="confirm-dialog-title">{title}</h2></div><button type="button" disabled={busy} onClick={onClose} aria-label="Close"><X size={18} /></button></header>
+      <p id="confirm-dialog-description">{description}</p>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <footer><button type="button" className="dialog-cancel" disabled={busy} onClick={onClose}>Cancel</button><button type="button" className="dialog-save danger" disabled={busy} onClick={onConfirm}>{busy ? 'Working…' : confirmLabel}</button></footer>
+    </section>
+  </div>
+}
+
+function EnvEditor({ value, onChange }: { value: string; onChange: (next: string) => void }) {
+  const [mode, setMode] = useState<'plain' | 'pairs'>('plain')
+  const [rows, setRows] = useState<EnvRow[]>([])
+
+  const switchMode = (next: 'plain' | 'pairs') => {
+    if (next === 'pairs') setRows(parseEnv(value))
+    setMode(next)
+  }
+
+  const updateRows = (nextRows: EnvRow[]) => {
+    setRows(nextRows)
+    onChange(serializeEnv(nextRows))
+  }
+
+  return <div className="env-editor">
+    <div className="env-editor-header">
+      <span>Environment variables</span>
+      <div className="env-mode-toggle" role="group" aria-label="Environment editor mode">
+        <button type="button" className={mode === 'pairs' ? 'active' : ''} aria-pressed={mode === 'pairs'} onClick={() => switchMode('pairs')}>Key/value</button>
+        <button type="button" className={mode === 'plain' ? 'active' : ''} aria-pressed={mode === 'plain'} onClick={() => switchMode('plain')}>Plain text</button>
+      </div>
+    </div>
+    {mode === 'plain'
+      ? <textarea rows={6} value={value} onChange={(event) => onChange(event.target.value)} placeholder={'KEY=value\nANOTHER=thing'} aria-label="Environment variables as text" spellCheck={false} />
+      : <>
+          {rows.length === 0 && <p className="env-empty">No variables yet. Add one below or switch to plain text.</p>}
+          <div className="env-rows">
+            {rows.map((row, index) => <div className="env-row" key={index}>
+              <input aria-label={`Variable key ${index + 1}`} placeholder="KEY" value={row.key} spellCheck={false} onChange={(event) => updateRows(rows.map((item, position) => position === index ? { ...item, key: event.target.value } : item))} />
+              <input aria-label={`Variable value ${index + 1}`} placeholder="value" value={row.value} spellCheck={false} onChange={(event) => updateRows(rows.map((item, position) => position === index ? { ...item, value: event.target.value } : item))} />
+              <button type="button" aria-label={`Remove variable ${index + 1}`} onClick={() => updateRows(rows.filter((_, position) => position !== index))}><X size={13} /></button>
+            </div>)}
+          </div>
+          <button type="button" className="env-add-row" onClick={() => updateRows([...rows, { key: '', value: '' }])}><Plus size={13} /> Add variable</button>
+        </>}
+    <small>Stored encrypted. Comments and blank lines are dropped when you edit in key/value mode.</small>
+  </div>
+}
+
+const DEFAULT_WORKER_SCRIPT = 'export default {\n  async fetch(request, env) {\n    return new Response("Hello from Skywatch!");\n  }\n};'
+const COMPOSE_PLACEHOLDER = 'services:\n  app:\n    image: ghcr.io/user/app:latest\n    ports:\n      - "8080:8080"'
+
+function ProjectFormDialog({ project, onClose, onSaved }: {
+  project: ProjectDetail | null
+  onClose: () => void
+  onSaved: () => Promise<void>
+}) {
+  const config = project?.sourceConfig ?? {}
+  const configText = (key: string): string => {
+    const entry = config[key]
+    return typeof entry === 'string' ? entry : ''
+  }
+  const [name, setName] = useState(project?.name ?? '')
+  const [sourceType, setSourceType] = useState<SourceType>(project?.sourceType ?? 'compose')
+  const [compose, setCompose] = useState(project?.sourceType === 'compose' ? configText('compose') : '')
+  const [repoUrl, setRepoUrl] = useState(project?.sourceType === 'github' ? configText('repoUrl') : '')
+  const [branch, setBranch] = useState(project?.sourceType === 'github' ? configText('branch') : '')
+  const [buildMode, setBuildMode] = useState<'docker' | 'command'>(project?.sourceType === 'github' && config.buildMode === 'command' ? 'command' : 'docker')
+  const [dockerfilePath, setDockerfilePath] = useState(project?.sourceType === 'github' ? configText('dockerfilePath') : '')
+  const [buildCommand, setBuildCommand] = useState(project?.sourceType === 'github' ? configText('buildCommand') : '')
+  const [image, setImage] = useState(project?.sourceType === 'image' ? configText('image') : '')
+  const [script, setScript] = useState(project?.sourceType === 'script' ? configText('script') : DEFAULT_WORKER_SCRIPT)
+  const [env, setEnv] = useState(project?.env ?? '')
+  const [error, setError] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  const validate = (): string => {
+    if (!name.trim()) return 'Name is required.'
+    if (sourceType === 'compose' && !compose.trim()) return 'Compose YAML is required.'
+    if (sourceType === 'github') {
+      if (!/^(https:\/\/|git@|ssh:\/\/)/.test(repoUrl.trim())) return 'Repository URL must start with https://, git@, or ssh://.'
+      if (buildMode === 'command' && !buildCommand.trim()) return 'A build command is required for the custom build mode.'
+    }
+    if (sourceType === 'image' && !image.trim()) return 'An image reference is required.'
+    if (sourceType === 'script' && !script.trim()) return 'Worker script source is required.'
+    return ''
+  }
+
+  const save = async () => {
+    const problem = validate()
+    if (problem) {
+      setError(problem)
+      return
+    }
+    setSaving(true)
+    setError('')
+    const sourceConfig: Record<string, unknown> =
+      sourceType === 'compose' ? { compose: compose.trim() }
+      : sourceType === 'github' ? {
+          repoUrl: repoUrl.trim(),
+          ...(branch.trim() ? { branch: branch.trim() } : {}),
+          buildMode,
+          ...(buildMode === 'docker'
+            ? (dockerfilePath.trim() ? { dockerfilePath: dockerfilePath.trim() } : {})
+            : { buildCommand: buildCommand.trim() }),
+        }
+      : sourceType === 'image' ? { image: image.trim() }
+      : { script }
+    try {
+      await api(project ? `/api/projects/${encodeURIComponent(project.id)}` : '/api/projects', {
+        method: project ? 'PUT' : 'POST',
+        body: JSON.stringify({ name: name.trim(), sourceType, sourceConfig, env }),
+      })
+      await onSaved()
+      onClose()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'The project could not be saved.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (!saving && event.target === event.currentTarget) onClose() }}>
+    <section className="access-dialog dialog-wide" role="dialog" aria-modal="true" aria-labelledby="project-form-title">
+      <header><div><span className="eyebrow"><span /> {project ? 'Edit project' : 'Project source'}</span><h2 id="project-form-title">{project ? project.name : 'New project'}</h2></div><button type="button" onClick={onClose} aria-label="Close"><X size={18} /></button></header>
+      <form className="project-form" onSubmit={(event) => { event.preventDefault(); void save() }}>
+        <label><span>Name</span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="my-service" autoComplete="off" spellCheck="false" /></label>
+        <div className="project-field">
+          <span>Source type</span>
+          <div className="source-switch" role="radiogroup" aria-label="Source type">
+            {([['compose', 'Docker Compose'], ['github', 'GitHub repo'], ['image', 'Docker image'], ['script', 'Worker script']] as Array<[SourceType, string]>).map(([value, label]) => (
+              <button key={value} type="button" role="radio" aria-checked={sourceType === value} className={sourceType === value ? 'active' : ''} onClick={() => setSourceType(value)}>{label}</button>
+            ))}
+          </div>
+        </div>
+        {sourceType === 'compose' && <label><span>Compose YAML</span><textarea rows={14} value={compose} onChange={(event) => setCompose(event.target.value)} placeholder={COMPOSE_PLACEHOLDER} spellCheck="false" /></label>}
+        {sourceType === 'github' && <>
+          <label><span>Repository URL</span><input value={repoUrl} onChange={(event) => setRepoUrl(event.target.value)} placeholder="https://github.com/user/repo.git or git@github.com:user/repo.git" autoComplete="off" spellCheck="false" /></label>
+          <div className="field-row">
+            <label><span>Branch (optional)</span><input value={branch} onChange={(event) => setBranch(event.target.value)} placeholder="main" autoComplete="off" spellCheck="false" /></label>
+            <label><span>Build mode</span><select value={buildMode} onChange={(event) => setBuildMode(event.target.value === 'command' ? 'command' : 'docker')}><option value="docker">Docker build</option><option value="command">Custom build command</option></select></label>
+          </div>
+          {buildMode === 'docker'
+            ? <label><span>Dockerfile path (optional)</span><input value={dockerfilePath} onChange={(event) => setDockerfilePath(event.target.value)} placeholder="Dockerfile" autoComplete="off" spellCheck="false" /></label>
+            : <label><span>Build command</span><textarea rows={3} value={buildCommand} onChange={(event) => setBuildCommand(event.target.value)} placeholder="docker compose up -d --build" spellCheck="false" /></label>}
+          <p className="field-hint">Skywatch uses your saved GitHub token for private repos over HTTPS; SSH uses the agent’s host keys.</p>
+        </>}
+        {sourceType === 'image' && <label><span>Image reference</span><input value={image} onChange={(event) => setImage(event.target.value)} placeholder="ghcr.io/user/app:latest" autoComplete="off" spellCheck="false" /></label>}
+        {sourceType === 'script' && <label><span>Worker script</span><textarea rows={16} value={script} onChange={(event) => setScript(event.target.value)} placeholder={DEFAULT_WORKER_SCRIPT} spellCheck="false" /></label>}
+        <EnvEditor value={env} onChange={setEnv} />
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <footer><button type="button" className="dialog-cancel" disabled={saving} onClick={onClose}>Cancel</button><button type="submit" className="dialog-save" disabled={saving}>{saving ? 'Saving…' : project ? 'Save project' : 'Create project'}</button></footer>
+      </form>
+    </section>
+  </div>
+}
+
+function DeployDialog({ project, servers, onClose, onDeployed }: {
+  project: ProjectSummary
+  servers: AgentConfig[]
+  onClose: () => void
+  onDeployed: () => Promise<void>
+}) {
+  const scriptOnly = project.sourceType === 'script'
+  const [targetType, setTargetType] = useState<'vps' | 'cloudflare'>(scriptOnly ? 'cloudflare' : 'vps')
+  const [serverId, setServerId] = useState('')
+  const [workerName, setWorkerName] = useState(slugifyWorkerName(project.name))
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [result, setResult] = useState<Deployment | null>(null)
+
+  const selectTarget = (next: 'vps' | 'cloudflare') => {
+    if (next === 'vps' && scriptOnly) return
+    if (next === 'cloudflare' && project.sourceType !== 'script') return
+    setTargetType(next)
+    setError('')
+  }
+
+  const submit = async () => {
+    setError('')
+    if (targetType === 'cloudflare' && !WORKER_NAME_RE.test(workerName)) {
+      setError('Worker names must be 1–63 characters of lowercase letters, numbers, and single dashes, starting with a letter or number.')
+      return
+    }
+    if (targetType === 'vps' && !serverId) {
+      setError('Choose a server to deploy to.')
+      return
+    }
+    setBusy(true)
+    try {
+      const body = targetType === 'vps' ? { targetType, serverId } : { targetType, workerName }
+      const deployed = await api<{ deployment: Deployment }>(`/api/projects/${encodeURIComponent(project.id)}/deploy`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+      setResult(deployed.deployment)
+      await onDeployed()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'The deployment could not be started.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (!busy && event.target === event.currentTarget) onClose() }}>
+    <section className="access-dialog" role="dialog" aria-modal="true" aria-labelledby="deploy-dialog-title">
+      <header><div><span className="eyebrow"><span /> Deploy project</span><h2 id="deploy-dialog-title">{project.name}</h2></div><button type="button" disabled={busy} onClick={onClose} aria-label="Close"><X size={18} /></button></header>
+      <div className="mode-switch" role="radiogroup" aria-label="Deploy target">
+        <button type="button" role="radio" aria-checked={targetType === 'vps'} disabled={scriptOnly} className={targetType === 'vps' ? 'active' : ''} onClick={() => selectTarget('vps')}><Server size={16} /><span><strong>VPS server</strong><small>{scriptOnly ? 'Not available for Worker scripts' : 'Run on a registered node'}</small></span></button>
+        <button type="button" role="radio" aria-checked={targetType === 'cloudflare'} disabled={!scriptOnly} className={targetType === 'cloudflare' ? 'active' : ''} onClick={() => selectTarget('cloudflare')}><Cloud size={16} /><span><strong>Cloudflare Worker</strong><small>{scriptOnly ? 'Deploy the script to your account' : 'Worker scripts only'}</small></span></button>
+      </div>
+      {!result && targetType === 'vps' && <label className="deploy-field"><span>Server</span><select value={serverId} onChange={(event) => setServerId(event.target.value)} aria-label="Server">
+        {servers.length === 0
+          ? <option value="" disabled>No servers registered</option>
+          : <option value="" disabled={Boolean(serverId)}>Select a server</option>}
+        {sortServers(servers).map((server) => <option key={server.id} value={server.id}>{server.node.name}</option>)}
+      </select></label>}
+      {!result && targetType === 'cloudflare' && <label className="deploy-field"><span>Worker name</span><input value={workerName} onChange={(event) => setWorkerName(event.target.value)} placeholder="my-worker" autoComplete="off" spellCheck="false" /><small>Lowercase letters, numbers, and single dashes. This becomes the Worker script name.</small></label>}
+      {error && <p className="form-error" role="alert">{error}</p>}
+      {result && <div className="deploy-result" aria-live="polite"><DeploymentStatusPill status={result.status} /><span>Deployment {result.status} on {deploymentTargetLabel(result, servers)}.</span></div>}
+      <footer>{result
+        ? <button type="button" className="dialog-save" onClick={onClose}>Done</button>
+        : <><button type="button" className="dialog-cancel" disabled={busy} onClick={onClose}>Cancel</button><button type="button" className="dialog-save" disabled={busy} onClick={() => void submit()}>{busy ? 'Deploying…' : 'Start deployment'}</button></>}</footer>
+    </section>
+  </div>
+}
+
+function GitHubTokenDialog({ onClose }: { onClose: () => void }) {
+  const [credential, setCredential] = useState<GitHubCredential | null>(null)
+  const [token, setToken] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    api<GitHubCredential>('/api/credentials/github')
+      .then((result) => { if (!cancelled) { setCredential(result); setLoading(false) } })
+      .catch((caught) => { if (!cancelled) { setError(caught instanceof Error ? caught.message : 'The GitHub credential could not be loaded.'); setLoading(false) } })
+    return () => { cancelled = true }
+  }, [])
+
+  const save = async () => {
+    if (!token.trim()) {
+      setError('Paste a token first.')
+      return
+    }
+    setBusy(true)
+    setError('')
+    try {
+      const result = await api<GitHubCredential>('/api/credentials/github', {
+        method: 'PUT',
+        body: JSON.stringify({ token: token.trim() }),
+      })
+      setCredential(result)
+      setToken('')
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'The token could not be saved.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const remove = async () => {
+    if (!window.confirm('Remove the saved GitHub token? Private repository deploys over HTTPS will stop working.')) return
+    setBusy(true)
+    setError('')
+    try {
+      await api('/api/credentials/github', { method: 'DELETE' })
+      setCredential({ configured: false, label: null, updatedAt: null })
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'The token could not be removed.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (!busy && event.target === event.currentTarget) onClose() }}>
+    <section className="access-dialog" role="dialog" aria-modal="true" aria-labelledby="github-token-title">
+      <header><div><span className="eyebrow"><span /> GitHub credential</span><h2 id="github-token-title">GitHub token</h2></div><button type="button" disabled={busy} onClick={onClose} aria-label="Close"><X size={18} /></button></header>
+      {loading && <p className="dialog-loading"><RefreshCw className="spin" size={14} /> Checking the stored credential…</p>}
+      {!loading && credential?.configured && <div className="dialog-notice github-credential"><GitBranch size={16} /><span>Configured as {credential.label ?? 'unknown'}{credential.updatedAt ? ` (updated ${relativeDate(credential.updatedAt)})` : ''}.</span></div>}
+      {!loading && !credential?.configured && <p className="dialog-copy">Used to clone private GitHub repositories over HTTPS. The token is encrypted before it touches storage.</p>}
+      {!loading && <label className="deploy-field"><span>{credential?.configured ? 'Replace token' : 'Token'}</span><input type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="ghp_…" autoComplete="off" spellCheck="false" /></label>}
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <footer>
+        {credential?.configured && <button type="button" className="dialog-cancel dialog-danger-text" disabled={busy} onClick={() => void remove()}>Remove token</button>}
+        <button type="button" className="dialog-cancel" disabled={busy} onClick={onClose}>Close</button>
+        {!loading && <button type="button" className="dialog-save" disabled={busy || !token.trim()} onClick={() => void save()}>{busy ? 'Saving…' : credential?.configured ? 'Replace token' : 'Save token'}</button>}
+      </footer>
+    </section>
+  </div>
+}
+
+function ProjectDeployments({ projectId, servers, onChanged }: {
+  projectId: string
+  servers: AgentConfig[]
+  onChanged: () => Promise<void>
+}) {
+  const [deployments, setDeployments] = useState<Deployment[] | null>(null)
+  const [error, setError] = useState('')
+  const [openDetailId, setOpenDetailId] = useState<string | null>(null)
+  const [refreshingId, setRefreshingId] = useState<string | null>(null)
+  const [teardown, setTeardown] = useState<Deployment | null>(null)
+  const [teardownBusy, setTeardownBusy] = useState(false)
+  const [teardownError, setTeardownError] = useState('')
+
+  const load = useCallback(async () => {
+    setError('')
+    try {
+      const result = await api<{ project: ProjectDetail }>(`/api/projects/${encodeURIComponent(projectId)}`)
+      setDeployments(result.project.deployments)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Deployments could not be loaded.')
+    }
+  }, [projectId])
+
+  useEffect(() => { void load() }, [load])
+
+  const refreshDeployment = async (id: string) => {
+    setRefreshingId(id)
+    setError('')
+    try {
+      const result = await api<{ deployment: Deployment }>(`/api/deployments/${encodeURIComponent(id)}`)
+      setDeployments((current) => current ? current.map((deployment) => deployment.id === id ? result.deployment : deployment) : current)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'The deployment status could not be refreshed.')
+    } finally {
+      setRefreshingId(null)
+    }
+  }
+
+  const confirmTeardown = async () => {
+    if (!teardown || teardownBusy) return
+    setTeardownBusy(true)
+    setTeardownError('')
+    try {
+      await api(`/api/deployments/${encodeURIComponent(teardown.id)}`, { method: 'DELETE' })
+      setTeardown(null)
+      await load()
+      await onChanged()
+    } catch (caught) {
+      setTeardownError(caught instanceof Error ? caught.message : 'The deployment could not be torn down.')
+    } finally {
+      setTeardownBusy(false)
+    }
+  }
+
+  return <div className="project-deployments">
+    {error && <div className="dashboard-error" role="alert"><span>{error}</span><button type="button" onClick={() => void load()}>Try again</button></div>}
+    {!deployments && !error && <p className="deployments-note"><RefreshCw className="spin" size={13} /> Loading deployments…</p>}
+    {deployments && deployments.length === 0 && !error && <p className="deployments-note">No deployments yet. Use Deploy to ship this project.</p>}
+    {deployments?.map((deployment) => {
+      const canTeardown = deployment.targetType === 'vps' && deployment.status !== 'removed'
+      return <div className="deployment-item" key={deployment.id}>
+        <div className="deployment-row">
+          <DeploymentStatusPill status={deployment.status} />
+          <span className="deployment-target">{deploymentTargetLabel(deployment, servers)}</span>
+          <span className="deployment-time">{relativeDate(deployment.createdAt)}</span>
+          <div className="deployment-actions">
+            <button type="button" aria-expanded={openDetailId === deployment.id} onClick={() => setOpenDetailId((current) => current === deployment.id ? null : deployment.id)}><Terminal size={13} /> Detail</button>
+            <button type="button" disabled={refreshingId === deployment.id} aria-label="Refresh deployment status" onClick={() => void refreshDeployment(deployment.id)}><RefreshCw size={13} className={refreshingId === deployment.id ? 'spin' : ''} /> Refresh</button>
+            {canTeardown && <button type="button" className="danger" onClick={() => { setTeardownError(''); setTeardown(deployment) }}><Trash2 size={13} /> Tear down</button>}
+          </div>
+        </div>
+        {openDetailId === deployment.id && <pre className="deployment-detail">{deployment.detail || 'No detail recorded for this deployment.'}</pre>}
+      </div>
+    })}
+    {teardown && <ConfirmDialog eyebrow="Tear down deployment" title="Tear down deployment" description={`Skywatch asks the agent to stop and remove the stack on ${deploymentTargetLabel(teardown, servers)}. This cannot be undone.`} confirmLabel="Tear down" busy={teardownBusy} error={teardownError} onClose={() => { if (!teardownBusy) setTeardown(null) }} onConfirm={() => void confirmTeardown()} />}
+  </div>
+}
+
+function ProjectsDashboard({ projects, loading, error, reload }: {
+  projects: ProjectSummary[]
+  loading: boolean
+  error: string
+  reload: () => Promise<void>
+}) {
+  const [servers, setServers] = useState<AgentConfig[]>([])
+  const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [formOpen, setFormOpen] = useState(false)
+  const [formProject, setFormProject] = useState<ProjectDetail | null>(null)
+  const [formError, setFormError] = useState('')
+  const [editLoadingId, setEditLoadingId] = useState<string | null>(null)
+  const [deployProject, setDeployProject] = useState<ProjectSummary | null>(null)
+  const [deleteProject, setDeleteProject] = useState<ProjectSummary | null>(null)
+  const [deleteBusy, setDeleteBusy] = useState(false)
+  const [deleteError, setDeleteError] = useState('')
+  const [tokenOpen, setTokenOpen] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    api<AgentConfigsResponse>('/api/servers')
+      .then((result) => { if (!cancelled) setServers(result.servers) })
+      .catch(() => { /* server names are optional context for labels */ })
+    return () => { cancelled = true }
+  }, [])
+
+  const openEdit = async (project: ProjectSummary) => {
+    setFormError('')
+    setEditLoadingId(project.id)
+    try {
+      const result = await api<{ project: ProjectDetail }>(`/api/projects/${encodeURIComponent(project.id)}`)
+      setFormProject(result.project)
+      setFormOpen(true)
+    } catch (caught) {
+      setFormError(caught instanceof Error ? caught.message : 'The project could not be loaded.')
+    } finally {
+      setEditLoadingId(null)
+    }
+  }
+
+  const confirmDelete = async () => {
+    if (!deleteProject || deleteBusy) return
+    setDeleteBusy(true)
+    setDeleteError('')
+    try {
+      await api(`/api/projects/${encodeURIComponent(deleteProject.id)}`, { method: 'DELETE' })
+      setDeleteProject(null)
+      await reload()
+    } catch (caught) {
+      setDeleteError(caught instanceof Error ? caught.message : 'The project could not be deleted.')
+    } finally {
+      setDeleteBusy(false)
+    }
+  }
+
+  return <div className="content projects-content">
+    <div className="page-heading projects-heading">
+      <div><h1>Projects</h1><p>Deploy compose stacks, Docker images, and Worker scripts from one place.</p></div>
+      <div className="heading-actions">
+        <button className="secondary-button" type="button" onClick={() => setTokenOpen(true)}><GitBranch size={15} /> GitHub token</button>
+        <button className="action-primary" type="button" onClick={() => { setFormProject(null); setFormOpen(true) }}><Plus size={15} /> New project</button>
+      </div>
+    </div>
+
+    {(error || formError) && <div className="dashboard-error" role="alert"><span>{error || formError}</span><button type="button" onClick={() => void reload()}>Try again</button></div>}
+
+    <div className="project-list" aria-busy={loading}>
+      {loading && projects.length === 0 && <div className="empty-state"><RefreshCw className="spin" size={22} /><h2>Loading projects</h2><p>Reading project sources and deployments from D1.</p></div>}
+      {!loading && projects.length === 0 && !error && <div className="empty-state"><FolderGit2 size={22} /><h2>No projects yet</h2><p>Create a project to deploy a compose stack, Docker image, or Worker script.</p></div>}
+      {projects.map((project) => {
+        const expanded = expandedId === project.id
+        const latest = project.latestDeployment
+        return <article className="project-card" key={project.id}>
+          <div className="project-card-head">
+            <div className="project-primary">
+              <span className="project-icon"><FolderGit2 size={18} /></span>
+              <div><h3>{project.name}</h3><p>{projectSourceSummary(project)}</p></div>
+            </div>
+            <div className="project-tags"><span className="source-badge">{sourceTypeLabels[project.sourceType]}</span>{project.hasEnv && <span className="env-chip">env</span>}</div>
+            <div className="project-latest">{latest
+              ? <><DeploymentStatusPill status={latest.status} /><small>{deploymentTargetLabel(latest, servers)} · {relativeDate(latest.createdAt)}</small></>
+              : <small>Not deployed yet</small>}</div>
+            <div className="project-actions">
+              <button type="button" onClick={() => setDeployProject(project)}><Rocket size={14} /> Deploy</button>
+              <button type="button" disabled={editLoadingId === project.id} onClick={() => void openEdit(project)}><Pencil size={14} /> Edit</button>
+              <button type="button" className="danger" onClick={() => { setDeleteError(''); setDeleteProject(project) }}><Trash2 size={14} /> Delete</button>
+              <button type="button" className="icon-only" aria-expanded={expanded} aria-label={`${expanded ? 'Hide' : 'Show'} deployments for ${project.name}`} onClick={() => setExpandedId(expanded ? null : project.id)}>{expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}</button>
+            </div>
+          </div>
+          {expanded && <ProjectDeployments projectId={project.id} servers={servers} onChanged={reload} />}
+        </article>
+      })}
+    </div>
+
+    {formOpen && <ProjectFormDialog project={formProject} onClose={() => setFormOpen(false)} onSaved={reload} />}
+    {deployProject && <DeployDialog project={deployProject} servers={servers} onClose={() => setDeployProject(null)} onDeployed={reload} />}
+    {tokenOpen && <GitHubTokenDialog onClose={() => setTokenOpen(false)} />}
+    {deleteProject && <ConfirmDialog eyebrow="Delete project" title={`Delete ${deleteProject.name}`} description="The project source and its environment variables are removed. Active deployments are not torn down automatically." confirmLabel="Delete project" busy={deleteBusy} error={deleteError} onClose={() => { if (!deleteBusy) setDeleteProject(null) }} onConfirm={() => void confirmDelete()} />}
+  </div>
+}
+
 function Dashboard({ account }: { account: { id: string; name: string } }) {
-  const [section, setSection] = useState<'workers' | 'servers'>('workers')
+  const [section, setSection] = useState<'workers' | 'servers' | 'projects'>('workers')
   const [workers, setWorkers] = useState<Worker[]>([])
   const [syncedAt, setSyncedAt] = useState<string | null>(null)
   const [mobileNav, setMobileNav] = useState(false)
@@ -748,6 +1325,9 @@ function Dashboard({ account }: { account: { id: string; name: string } }) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [selected, setSelected] = useState<Worker | null>(null)
+  const [projects, setProjects] = useState<ProjectSummary[]>([])
+  const [projectsLoading, setProjectsLoading] = useState(true)
+  const [projectsError, setProjectsError] = useState('')
 
   const loadWorkers = async () => {
     setLoading(true)
@@ -765,6 +1345,21 @@ function Dashboard({ account }: { account: { id: string; name: string } }) {
 
   useEffect(() => { void loadWorkers() }, [])
 
+  const loadProjects = async () => {
+    setProjectsLoading(true)
+    setProjectsError('')
+    try {
+      const result = await api<ProjectsResponse>('/api/projects')
+      setProjects(result.projects)
+    } catch (caught) {
+      setProjectsError(caught instanceof Error ? caught.message : 'Projects could not be loaded.')
+    } finally {
+      setProjectsLoading(false)
+    }
+  }
+
+  useEffect(() => { void loadProjects() }, [])
+
   const filtered = useMemo(() => workers.filter((worker) =>
     filter === 'all' || worker.accessStatus === filter,
   ), [filter, workers])
@@ -778,6 +1373,7 @@ function Dashboard({ account }: { account: { id: string; name: string } }) {
           <span className="nav-label">Workspace</span>
           <button className={`nav-link nav-button ${section === 'workers' ? 'active' : ''}`} type="button" onClick={() => { setSection('workers'); setMobileNav(false) }}><LayoutGrid size={17} /> Workers <span>{workers.length}</span></button>
           <button className={`nav-link nav-button ${section === 'servers' ? 'active' : ''}`} type="button" onClick={() => { setSection('servers'); setMobileNav(false) }}><Server size={17} /> Servers</button>
+          <button className={`nav-link nav-button ${section === 'projects' ? 'active' : ''}`} type="button" onClick={() => { setSection('projects'); setMobileNav(false) }}><Rocket size={17} /> Projects <span>{projects.length}</span></button>
         </nav>
         <div className="sidebar-bottom">
           <div className="account-chip"><div><strong>{account.name}</strong><span>{account.id.slice(0, 10)}…</span></div></div>
@@ -791,7 +1387,9 @@ function Dashboard({ account }: { account: { id: string; name: string } }) {
           <button className="mobile-menu" type="button" onClick={() => setMobileNav(true)} aria-label="Open navigation"><Menu size={20} /></button>
           {section === 'workers'
             ? <div className="topbar-actions"><button className="secondary-button" type="button" disabled={loading} onClick={() => void loadWorkers()}><RefreshCw size={16} className={loading ? 'spin' : ''} /> Refresh</button></div>
-            : <div className="topbar-section"><Server size={16} /><span>Server operations</span></div>}
+            : section === 'servers'
+              ? <div className="topbar-section"><Server size={16} /><span>Server operations</span></div>
+              : <div className="topbar-section"><Rocket size={16} /><span>Projects and deployments</span></div>}
         </header>
 
         {section === 'workers' ? <div className="content">
@@ -834,7 +1432,7 @@ function Dashboard({ account }: { account: { id: string; name: string } }) {
             ))}
             {!loading && filtered.length === 0 && !error && <div className="empty-state"><Search size={22} /><h2>No Workers found</h2><p>Try a different access filter.</p></div>}
           </div>
-        </div> : <ServersDashboard />}
+        </div> : section === 'servers' ? <ServersDashboard /> : <ProjectsDashboard projects={projects} loading={projectsLoading} error={projectsError} reload={loadProjects} />}
       </section>
       {selected && <AccessDialog worker={selected} onClose={() => setSelected(null)} onSaved={loadWorkers} />}
     </main>
