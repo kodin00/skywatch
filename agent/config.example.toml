@@ -23,3 +23,7 @@ stats_concurrency = 4
 log_tail_default = 200
 log_tail_max = 1000
 log_bytes_max = 1048576
+
+# Root for deployment work directories (<deployments_dir>/<deploymentId>/).
+# Relative paths resolve against the directory of this config file.
+deployments_dir = "deployments"
